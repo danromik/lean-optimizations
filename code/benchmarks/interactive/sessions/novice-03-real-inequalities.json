@@ -1,0 +1,83 @@
+{
+  "name": "novice-03-real-inequalities",
+  "tier": "novice",
+  "project": "mathlib",
+  "description": "Exercise sheet on real inequalities under `import Mathlib`. Models a novice who guesses lemma names (`add_square`), expects `rw` to finish an algebraic identity, tries `positivity` and `linarith` on a goal that needs `nlinarith`, forgets to project a conjunction, tries `decide` on real numbers, and uses `exact?`, hover and completion.",
+  "initial_text": [
+    "import Mathlib",
+    "",
+    "-- Exercise sheet 5: real inequalities",
+    ""
+  ],
+  "events": [
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem sq_expand (x : ℝ) : (x + 1) ^ 2 = x ^ 2 + 2 * x + 1 := by",
+      "  rw [add_square]"
+    ], "note": "wrong lemma name"},
+    {"op": "expect_message", "contains": "unknown"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "rw [add_square]", "text": "rw [add_sq]", "note": "right lemma, but rw does not close the goal"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "goal", "end_of_line": "rw [add_sq]", "expect_goals": 1},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "rw [add_sq]", "text": "ring"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem nonneg_example (x : ℝ) : 0 ≤ x ^ 2 + 2 * x + 1 := by",
+      "  positivity"
+    ], "note": "positivity cannot see that 2 * x may be negative"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "positivity", "text": "linarith"},
+    {"op": "expect_message", "contains": "linarith failed"},
+    {"op": "wait", "ms": 4000, "note": "remembers (x+1)^2"},
+    {"op": "replace", "find": "linarith", "text": "nlinarith [sq_nonneg (x + 1)]"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "sq_nonneg"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem abs_example (x : ℝ) (h : |x| < 1) : x < 1 := by",
+      "  exact abs_lt.mp h"
+    ], "note": "forgets to take the second component"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "goal", "after": "x < 1 := by", "expect_goals": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "exact abs_lt.mp h", "text": "exact (abs_lt.mp h).2"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2500},
+    {"op": "type", "append": true, "pause_ms": 800, "text": [
+      "",
+      "example : (2 : ℝ) + 2 = 4 := by",
+      "  decide"
+    ], "note": "decide on the reals"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2000},
+    {"op": "replace", "find": "decide", "text": "norm_num"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem mul_pos_example (a b : ℝ) (ha : 0 < a) (hb : 0 < b) : 0 < a * b := by",
+      "  exact?"
+    ]},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "exact?", "text": "exact mul_pos ha hb"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example (x : ℝ) : 0 ≤ x ^ 2 := sq_nonn"
+    ]},
+    {"op": "completion", "after": ":= sq_nonn", "expect_item": "sq_nonneg"},
+    {"op": "replace", "find": ":= sq_nonn", "text": ":= sq_nonneg x"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "name": "inter-01-finset-sums",
+  "tier": "intermediate",
+  "project": "mathlib",
+  "description": "Development-style file with precise imports: a closed form for ∑ i(i+1) proved by induction with a `calc` block. Models an intermediate user who writes a wrong intermediate calc step and fixes it, refactors the algebra into a helper lemma *above* the theorem (every later command re-elaborates), reaches for `linarith` before the import is there (adds `import Mathlib.Tactic.Linarith` → the worker restarts and re-imports), sees `linarith` fail on a nonlinear goal and switches to `nlinarith`, and tunes a `simp only` list.",
+  "initial_text": [
+    "import Mathlib.Algebra.BigOperators.Group.Finset.Basic",
+    "import Mathlib.Tactic.Ring",
+    "",
+    "/-!",
+    "# Sums of consecutive products",
+    "-/",
+    "",
+    "open Finset",
+    ""
+  ],
+  "events": [
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1500, "text": [
+      "",
+      "theorem sum_range_mul_succ (n : ℕ) :",
+      "    (∑ i ∈ range (n + 1), i * (i + 1)) * 3 = n * (n + 1) * (n + 2) := by",
+      "  sorry"
+    ]},
+    {"op": "expect_no_errors"},
+    {"op": "goal", "after": "(n + 2) := by", "expect_goals": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  sorry", "text": [
+      "  induction n with",
+      "  | zero => simp",
+      "  | succ k ih =>",
+      "    calc (∑ i ∈ range (k + 1 + 1), i * (i + 1)) * 3",
+      "        = (∑ i ∈ range (k + 1), i * (i + 1)) * 3 + (k + 1) * (k + 1 + 1) * 3 := by",
+      "          rw [sum_range_succ, add_mul]",
+      "      _ = k * (k + 1) * (k + 2) + (k + 1) * (k + 1 + 1) * 2 := by rw [ih]",
+      "      _ = (k + 1) * (k + 1 + 1) * (k + 1 + 2) := by ring"
+    ], "note": "calc with a wrong intermediate step (* 2 instead of * 3)"},
+    {"op": "expect_errors", "n": 2},
+    {"op": "goal", "end_of_line": "* 2 := by rw [ih]", "expect_goals": 1},
+    {"op": "wait", "ms": 5000, "note": "spots the typo"},
+    {"op": "replace", "find": "* 2 := by rw [ih]", "text": "* 3 := by rw [ih]"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 4000, "note": "decides to factor the algebra out"},
+    {"op": "insert", "before": "theorem sum_range_mul_succ", "text": [
+      "lemma step_identity (k : ℕ) :",
+      "    k * (k + 1) * (k + 2) + (k + 1) * (k + 1 + 1) * 3 = (k + 1) * (k + 1 + 1) * (k + 1 + 2) := by",
+      "  ring",
+      "",
+      ""
+    ], "note": "helper lemma inserted above: everything below re-elaborates"},
+    {"op": "expect_no_errors"},
+    {"op": "replace", "find": "(k + 1 + 2) := by ring", "text": "(k + 1 + 2) := step_identity k"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "step_identity k"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem two_mul_le_sq_add_sq (a b : ℤ) : 2 * a * b ≤ a ^ 2 + b ^ 2 := by",
+      "  linarith"
+    ], "note": "linarith is not imported yet"},
+    {"op": "expect_errors", "n": [1, 3]},
+    {"op": "wait", "ms": 3000, "note": "realises the import is missing"},
+    {"op": "insert", "after": "import Mathlib.Tactic.Ring", "text": "\nimport Mathlib.Tactic.Linarith", "note": "header edit: worker restart + re-import"},
+    {"op": "expect_message", "contains": "linarith failed"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  linarith", "text": "  nlinarith [sq_nonneg (a - b)]"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem sum_const_two (n : ℕ) : ∑ _i ∈ range n, (2 : ℕ) = 2 * n := by",
+      "  simp only [sum_const, card_range]"
+    ], "note": "simp only list too short"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "goal", "end_of_line": "simp only [sum_const, card_range]", "expect_goals": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "simp only [sum_const, card_range]", "text": "simp only [sum_const, card_range]\n  ring"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example (f : ℕ → ℕ) (n : ℕ) : ∑ i ∈ range (n + 1), f i = ∑ i ∈ range n, f i + f n := sum_range_su"
+    ]},
+    {"op": "completion", "after":  "f n := sum_range_su", "expect_item": "sum_range_succ"},
+    {"op": "replace", "find": ":= sum_range_su", "text": ":= sum_range_succ f n"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

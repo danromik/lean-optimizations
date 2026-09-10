@@ -1,0 +1,76 @@
+{
+  "name": "adv-01-flt-quadratic",
+  "tier": "advanced",
+  "project": "FLT",
+  "initial_file": "FLT/Mathlib/Algebra/Polynomial/QuadraticDiscriminant.lean",
+  "description": "Inside FLT's `FLT/Mathlib/Algebra/Polynomial/QuadraticDiscriminant.lean` (module header, `linear_combination`/`field_simp` proofs over a general field; FLT pins Lean v4.34.0-rc1, so this session runs on the project's own toolchain). Models an expert who reads the file, breaks and repairs the proof of the first lemma (every later theorem re-elaborates twice), inserts a new discriminant lemma mid-file (cascade), states a typeclass-heavy corollary with an undeclared universe, forgets an explicit argument, runs `exact?` on a field goal (first-call index build), and adds a `positivity` example.",
+  "events": [
+    {"op": "wait", "ms": 8000, "note": "reads the file while it elaborates"},
+    {"op": "goal", "after": "  rw [derivative_quadratic]", "expect_goals": 1},
+    {"op": "hover", "before": "linear_combination hid"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  simp\n  ring\n\n/-- The Bézout", "text": "  simp\n\n/-- The Bézout", "note": "breaks the first lemma: everything below re-elaborates"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  simp\n\n/-- The Bézout", "text": "  simp; ring\n\n/-- The Bézout"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 5000, "note": "plans a new lemma"},
+    {"op": "type", "before": "/-- A quadratic polynomial `a X² + b X + c` (with `a ≠ 0`) over a field is separable", "pause_ms": 1500, "text": [
+      "/-- At a root `x` of `a x² + b x + c`, the discriminant is the square of `2 a x + b`. -/",
+      "theorem discrim_eq_sq_of_root {k : Type*} [Field k] {a b c x : k}",
+      "    (hx : a * x ^ 2 + b * x + c = 0) : discrim a b c = (2 * a * x + b) ^ 2 := by",
+      "  rw [discrim]",
+      "  linear_combination -4 * a * hx",
+      "",
+      ""
+    ], "note": "lemma inserted mid-file"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 4000},
+    {"op": "type", "before": "end Polynomial", "pause_ms": 1500, "text": [
+      "theorem splits_of_isSquare_discrim {k : Type u} [Field k] [NeZero (2 : k)] {a b c : k} (ha : a ≠ 0)",
+      "    (h : IsSquare (discrim a b c)) : (C a * X ^ 2 + C b * X + C c).Splits :=",
+      "  (splits_quadratic_iff ha).mpr h",
+      "",
+      ""
+    ], "note": "undeclared universe"},
+    {"op": "expect_message", "contains": "universe"},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "{k : Type u} [Field k] [NeZero", "text": "{k : Type*} [Field k] [NeZero"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end Polynomial", "pause_ms": 1500, "text": [
+      "example {k : Type*} [Field k] {a b c : k} (ha : a ≠ 0)",
+      "    (hsep : (C a * X ^ 2 + C b * X + C c).Separable) : b ^ 2 - 4 * a * c ≠ 0 :=",
+      "  separable_quadratic_iff.mp hsep",
+      "",
+      ""
+    ], "note": "forgets the explicit argument ha"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "  separable_quadratic_iff.mp hsep", "text": "  (separable_quadratic_iff ha).mp hsep"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end Polynomial", "pause_ms": 1000, "text": [
+      "example {k : Type*} [Field k] (a : k) (ha : a ≠ 0) : a⁻¹ * a = 1 := by",
+      "  exact?",
+      "",
+      ""
+    ], "note": "library search: first call builds the index"},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  exact?", "text": "  exact inv_mul_cancel₀ ha"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "before": "end Polynomial", "pause_ms": 1000, "text": [
+      "example {k : Type*} [Field k] [LinearOrder k] [IsStrictOrderedRing k] (a b : k) :",
+      "    0 ≤ a ^ 2 + b ^ 2 := by",
+      "  positivity",
+      "",
+      ""
+    ]},
+    {"op": "expect_no_errors"},
+    {"op": "completion", "after": "  exact inv_mul_cancel₀ ha", "expect_min_items": 0},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

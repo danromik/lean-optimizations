@@ -1,0 +1,88 @@
+{
+  "name": "novice-01-induction-sum",
+  "tier": "novice",
+  "project": "mathlib",
+  "description": "First-year exercise sheet: Gauss' sum and the sum of odd numbers by induction, under `import Mathlib`. Models a novice who reaches for `rw [ih]` before the sum is unfolded, forgets `mul_add`, rewrites with `Nat.succ_eq_add_one` on a goal that already shows `k + 1`, tries `simp` on a goal simp cannot touch, uses `exact?`, and asks for completions.",
+  "initial_text": [
+    "import Mathlib",
+    "",
+    "-- Exercise sheet 3: sums and induction",
+    ""
+  ],
+  "events": [
+    {"op": "wait", "ms": 3000, "note": "reads the exercise"},
+    {"op": "type", "append": true, "pause_ms": 1500, "text": [
+      "",
+      "/-- Gauss' formula. -/",
+      "theorem two_mul_sum_range (n : ℕ) : 2 * (∑ i ∈ Finset.range (n + 1), i) = n * (n + 1) := by",
+      "  sorry"
+    ]},
+    {"op": "expect_no_errors", "note": "statement parses; only the sorry warning"},
+    {"op": "goal", "after": "n * (n + 1) := by", "expect_goals": 1},
+    {"op": "wait", "ms": 2500, "note": "thinks about induction"},
+    {"op": "replace", "find": "sorry", "text": ["induction n with", "  | zero => simp", "  | succ k ih =>", "    sorry"]},
+    {"op": "expect_no_errors"},
+    {"op": "goal", "before": "sorry", "expect_goals": 1, "expect_contains": "k + 1"},
+    {"op": "wait", "ms": 4000, "note": "stares at the succ goal"},
+    {"op": "replace", "find": "sorry", "text": "rw [ih]", "note": "misconception: rewrite with ih before unfolding the sum"},
+    {"op": "expect_message", "contains": "did not find an occurrence"},
+    {"op": "wait", "ms": 3000, "note": "reads the error"},
+    {"op": "replace", "find": "rw [ih]", "text": "rw [Finset.sum_range_succ, ih]", "note": "unfolds the sum but the pattern is still under a 2 * (_ + _)"},
+    {"op": "expect_message", "contains": "did not find an occurrence"},
+    {"op": "goal", "end_of_line": "rw [Finset.sum_range_succ, ih]", "expect_goals": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "rw [Finset.sum_range_succ, ih]", "text": "rw [Finset.sum_range_succ, mul_add, ih]"},
+    {"op": "expect_errors", "n": 1, "note": "unsolved goals after the rewrites"},
+    {"op": "expect_message", "contains": "unsolved goals"},
+    {"op": "goal", "end_of_line": "mul_add, ih]", "expect_goals": 1},
+    {"op": "wait", "ms": 2000},
+    {"op": "insert", "after": "mul_add, ih]", "text": "\n    ring"},
+    {"op": "expect_no_errors", "note": "first theorem done"},
+    {"op": "hover", "before": "Finset.sum_range_succ"},
+    {"op": "wait", "ms": 3000, "note": "next exercise"},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "/-- The sum of the first `n` odd numbers. -/",
+      "theorem sum_odd (n : ℕ) : ∑ i ∈ Finset.range n, (2 * i + 1) = n ^ 2 := by",
+      "  induction n with",
+      "  | zero => simp",
+      "  | succ k ih =>",
+      "    rw [Finset.sum_range_succ, ih, Nat.succ_eq_add_one]",
+      "    ring"
+    ], "note": "succ-vs-+1 misconception: the goal already says k + 1"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": ", Nat.succ_eq_add_one]", "text": "]"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 800, "text": [
+      "",
+      "example (a b : ℕ) (h : a = b) : a = b := by",
+      "  simp"
+    ], "note": "simp made no progress"},
+    {"op": "expect_message", "contains": "made no progress"},
+    {"op": "wait", "ms": 2000},
+    {"op": "replace", "find": "simp", "occurrence": -1, "text": "exact h"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 800, "text": [
+      "",
+      "example (a b : ℕ) (h : a ≤ b) : a ≤ b + 1 := by",
+      "  exact?"
+    ], "note": "library search"},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000, "note": "reads the suggestion"},
+    {"op": "replace", "find": "exact?", "text": "exact Nat.le_succ_of_le h"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example (n : ℕ) : n + 0 = n := Nat.add_z"
+    ]},
+    {"op": "completion", "after": "Nat.add_z", "expect_item": "Nat.add_zero"},
+    {"op": "replace", "find": "Nat.add_z", "text": "Nat.add_zero n"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

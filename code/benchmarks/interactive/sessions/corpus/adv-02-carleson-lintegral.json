@@ -1,0 +1,51 @@
+{
+  "name": "adv-02-carleson-lintegral",
+  "tier": "advanced",
+  "project": "carleson",
+  "initial_file": "Carleson/ToMathlib/MeasureTheory/Integral/Misc.lean",
+  "description": "Inside Carleson's `Carleson/ToMathlib/MeasureTheory/Integral/Misc.lean`: one 100-line measure-theory proof (`Antitone.ennreal_induction'`, `gcongr`, `filter_upwards`, `fun_prop`; Carleson pins Lean v4.34.0-rc2, own toolchain). Models an expert who waits for the heavy proof, inserts a helper lemma above it (with a missing argument, then fixed — two cascades of the big proof), makes a mistake deep inside the proof and reverts it, and adds `positivity`/`measurability`/`exact?` examples at the end.",
+  "events": [
+    {"op": "wait", "ms": 10000, "note": "long catch-up while the big proof elaborates"},
+    {"op": "goal", "after": "      gcongr 1\n      exact h", "expect_goals": 0},
+    {"op": "goal", "after": "  revert k\n  apply Antitone.ennreal_induction'", "expect_goals": 2},
+    {"op": "wait", "ms": 4000},
+    {"op": "type", "before": "-- This is Theorem 4.19", "pause_ms": 1500, "text": [
+      "lemma le_two_mul_self (x : ℝ≥0∞) : x ≤ 2 * x :=",
+      "  le_mul_of_one_le_left (by norm_num)",
+      ""
+    ], "note": "helper lemma above the big proof, one argument short"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  le_mul_of_one_le_left (by norm_num)", "text": "  le_mul_of_one_le_left zero_le (by norm_num)"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "le_mul_of_one_le_left zero_le"},
+    {"op": "wait", "ms": 5000},
+    {"op": "replace", "find": "      gcongr 1\n      exact h\n", "text": "      gcongr 1\n      exact h.le\n", "note": "mistake deep inside the proof"},
+    {"op": "expect_errors", "n": [1, 5]},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "      gcongr 1\n      exact h.le\n", "text": "      gcongr 1\n      exact h\n"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "example : MeasurableSet (Set.Iio (1 : ℝ≥0)) := by",
+      "  measurability",
+      "",
+      "example (f : ℝ≥0 → ℝ≥0∞) (hf : Measurable f) : AEMeasurable f := by",
+      "  exact?"
+    ]},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  exact?", "text": "  exact hf.aemeasurable"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "example (x y : ℝ≥0∞) (h : x ≤ y) : 2 * x ≤ 2 * y := by",
+      "  gcongr"
+    ]},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

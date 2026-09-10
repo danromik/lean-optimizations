@@ -1,0 +1,95 @@
+{
+  "name": "novice-02-logic-sets",
+  "tier": "novice",
+  "project": "mathlib",
+  "description": "First exercise sheet on logic and sets under `import Mathlib`. Models a novice who uses `intro` on a conjunction, gets the `constructor` bullets in the wrong order, introduces too many variables for a `∀`, misplaces parentheses in a term, forgets that `hx : x ∈ s ∩ t` is a pair, follows `use 5` with a tactic after the goal has already closed, uses `exact?` and completion.",
+  "initial_text": [
+    "import Mathlib",
+    "",
+    "-- Exercise sheet 1: logic and sets",
+    ""
+  ],
+  "events": [
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem and_swap (p q : Prop) (h : p ∧ q) : q ∧ p := by",
+      "  intro hp hq"
+    ], "note": "misconception: intro on a conjunction in the goal"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "goal", "after": "q ∧ p := by", "expect_goals": 1},
+    {"op": "wait", "ms": 3000, "note": "reads the error"},
+    {"op": "replace", "find": "intro hp hq", "text": ["obtain ⟨hp, hq⟩ := h", "  constructor", "  · exact hp", "  · exact hq"],
+     "note": "bullets in the wrong order"},
+    {"op": "expect_errors", "n": 2},
+    {"op": "goal", "end_of_line": "  constructor", "expect_goals": 2},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "· exact hp\n  · exact hq", "text": "· exact hq\n  · exact hp"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem forall_example (f : ℕ → ℕ) (hf : ∀ x, f x = x) : ∀ y, f (f y) = y := by",
+      "  intro y z",
+      "  rw [hf, hf]"
+    ], "note": "one intro too many"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "intro y z", "text": "intro y"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2500},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem lt_trans_example (a b c : ℕ) (h1 : a < b) (h2 : b ≤ c) : a < c := by",
+      "  exact Nat.lt_of_lt_of_le (h1 h2)"
+    ], "note": "misplaced parentheses"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "(h1 h2)", "text": "h1 h2"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "Nat.lt_of_lt_of_le"},
+    {"op": "wait", "ms": 3000, "note": "sets"},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem inter_subset_example (s t : Set ℕ) : s ∩ t ⊆ s := by",
+      "  intro x hx",
+      "  exact hx"
+    ], "note": "forgets that membership in an intersection is a pair"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "goal", "end_of_line": "intro x hx", "expect_goals": 1, "expect_contains": "x ∈ s"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "exact hx", "text": "exact hx.1"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem union_comm_example (s t : Set ℕ) : s ∪ t = t ∪ s := by",
+      "  exact?"
+    ]},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "exact?", "text": "exact Set.union_comm s t"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem exists_example : ∃ n : ℕ, n + n = 10 := by",
+      "  use 5",
+      "  norm_num"
+    ], "note": "`use` already closed the goal"},
+    {"op": "expect_message", "contains": "no goals"},
+    {"op": "wait", "ms": 2000},
+    {"op": "delete", "text": "\n  norm_num"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example (s : Set ℕ) : s ⊆ s := Set.Subset.re"
+    ]},
+    {"op": "completion", "after": "Set.Subset.re", "expect_item": "Set.Subset.refl"},
+    {"op": "replace", "find": "Set.Subset.re", "text": "Set.Subset.refl s"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

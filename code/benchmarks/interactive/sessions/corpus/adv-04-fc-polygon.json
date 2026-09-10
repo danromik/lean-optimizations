@@ -1,0 +1,60 @@
+{
+  "name": "adv-04-fc-polygon",
+  "tier": "advanced",
+  "project": "formal-conjectures",
+  "initial_file": "FormalConjectures/OEIS/64313.lean",
+  "description": "Inside formal-conjectures' `FormalConjectures/OEIS/64313.lean` (area of a regular n-gon: `Real.tan` special values, `Int.floor_eq_iff`, `field_simp`, `positivity`, `linarith`; formal-conjectures pins Lean v4.33.1, so this is the one corpus session that also runs on the fork toolchains). Models an expert who rewrites the definition `area` (all five test theorems below re-elaborate and some break), reverts it, inserts a positivity lemma mid-file (first with `sorry`, then a real proof), makes an explicit-argument mistake, and runs `exact?`.",
+  "events": [
+    {"op": "wait", "ms": 6000, "note": "reads the file"},
+    {"op": "goal", "after": "  dsimp [a, area]\n  rw [Real.tan_pi_div_six]", "expect_goals": 1},
+    {"op": "wait", "ms": 4000},
+    {"op": "replace", "find": "  (n : ℝ) / (4 * Real.tan (Real.pi / (n : ℝ)))", "text": "  (n : ℝ) / 4 / Real.tan (Real.pi / (n : ℝ))", "note": "definition change: every theorem below re-elaborates"},
+    {"op": "expect_errors", "n": [1, 6]},
+    {"op": "wait", "ms": 5000, "note": "sees the fallout and reverts"},
+    {"op": "replace", "find": "  (n : ℝ) / 4 / Real.tan (Real.pi / (n : ℝ))", "text": "  (n : ℝ) / (4 * Real.tan (Real.pi / (n : ℝ)))"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 4000},
+    {"op": "type", "before": "@[category test, AMS 51]\ntheorem a_4", "pause_ms": 1200, "text": [
+      "lemma area_pos (n : ℕ) (hn : 3 ≤ n) : 0 < area n := by",
+      "  sorry",
+      "",
+      ""
+    ], "note": "lemma inserted mid-file, proof deferred"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 6000, "note": "works out the proof"},
+    {"op": "replace", "find": "0 < area n := by\n  sorry", "text": [
+      "0 < area n := by",
+      "  unfold area",
+      "  have hn' : (3 : ℝ) ≤ n := by exact_mod_cast hn",
+      "  have hpos : 0 < Real.pi / n := by positivity",
+      "  have hlt : Real.pi / n < Real.pi / 2 := by",
+      "    gcongr",
+      "    linarith",
+      "  exact div_pos (by positivity) (mul_pos (by norm_num) (Real.tan_pos_of_pos_of_lt_pi_div_two hpos hlt))"
+    ]},
+    {"op": "expect_no_errors"},
+    {"op": "goal", "end_of_line": "    gcongr", "expect_goals": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end OeisA64313", "pause_ms": 1000, "text": [
+      "example : a 4 = 1 := a_4 4",
+      ""
+    ], "note": "explicit-argument mistake"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2000},
+    {"op": "replace", "find": "example : a 4 = 1 := a_4 4", "text": "example : a 4 = 1 := a_4"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end OeisA64313", "pause_ms": 1000, "text": [
+      "example (x : ℝ) (hx : 0 < x) : 0 < Real.sqrt x := by",
+      "  exact?",
+      ""
+    ]},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  exact?", "text": "  exact Real.sqrt_pos.mpr hx"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "Real.tan_pos_of_pos_of_lt_pi_div_two"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

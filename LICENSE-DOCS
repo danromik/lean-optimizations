@@ -1,0 +1,14 @@
+Copyright 2026 Dan Romik
+
+The documents in `docs/`, the paper (`paper.pdf` and its LaTeX source in `paper/`), and the
+README files throughout this package are licensed under the Creative Commons Attribution 4.0
+International licence (CC BY 4.0).
+
+    https://creativecommons.org/licenses/by/4.0/
+
+You are free to share and adapt this material for any purpose, including commercially, provided
+you give appropriate credit, link to the licence, and indicate if changes were made.
+
+The code in this package — everything under `patches/` and `code/` — is licensed separately,
+under the Apache License 2.0. See LICENSE. The patches are derived from Lean 4, which is itself
+Apache-2.0 licensed, and must remain so.

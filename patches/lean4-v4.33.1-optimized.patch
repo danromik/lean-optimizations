@@ -1,0 +1,2844 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 0f05832..daca2f0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -721,6 +721,13 @@ else()
+     set(GIT_SHA1 "")
+   endif()
+ endif()
++# Fork: allow embedding a fixed githash (e.g. the upstream release commit) so that a patched
++# toolchain reports the same `--githash` / `Lean.githash` as the release it is derived from and
++# keeps loading (and being trusted by Lake for) `.olean` files built by that release.
++if(LEAN_GITHASH_OVERRIDE)
++  set(GIT_SHA1 "${LEAN_GITHASH_OVERRIDE}")
++  message(STATUS "githash overridden: ${GIT_SHA1}")
++endif()
+ configure_file("${LEAN_SOURCE_DIR}/githash.h.in" "${LEAN_BINARY_DIR}/githash.h")
+ 
+ if(USE_LAKE AND STAGE EQUAL 0)
+diff --git a/src/Lean/Compiler/IR/CompilerM.lean b/src/Lean/Compiler/IR/CompilerM.lean
+index 228b06a..9e6032e 100644
+--- a/src/Lean/Compiler/IR/CompilerM.lean
++++ b/src/Lean/Compiler/IR/CompilerM.lean
+@@ -147,6 +147,13 @@ private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :
+   -- This function is never used in `leanir`, so no need for `findExtEntry?`
+   match env.getModuleIdxFor? declName with
+   | some modIdx =>
++    -- Lazy parts: the `.olean` copy of a `meta` declaration is the full declaration (identical to the one
++    -- in `.ir`), so consult it first to avoid loading the `.ir` part for `meta` code.
++    if env.header.lazyPartsId != 0 then
++      match findAtSorted? (declMapExt.getModuleEntries env modIdx) declName with
++      | some d@(.fdecl ..) => some d
++      | d? => findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|> d?
++    else
+     -- `meta import/import all` and additional server-mode IR
+     findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|>
+     -- (closure of) `meta def`; will report `.extern`s for other `def`s so needs to come second
+@@ -165,6 +172,11 @@ private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option D
+   -- not a local declaration.
+   match env.getModuleIdxFor? declName with
+   | some modIdx =>
++    if env.header.lazyPartsId != 0 then
++      match findAtSorted? (declMapExt.getModuleEntries env modIdx) boxed with
++      | some d@(.fdecl ..) => some d
++      | d? => findAtSorted? (declMapExt.getModuleIREntries env modIdx) boxed <|> d?
++    else
+     findAtSorted? (declMapExt.getModuleIREntries env modIdx) boxed <|>
+     findAtSorted? (declMapExt.getModuleEntries env modIdx) boxed
+   | none => declMapExt.getState env |>.find? boxed
+diff --git a/src/Lean/Elab/Frontend.lean b/src/Lean/Elab/Frontend.lean
+index 965a761..1219cff 100644
+--- a/src/Lean/Elab/Frontend.lean
++++ b/src/Lean/Elab/Frontend.lean
+@@ -14,6 +14,7 @@ import Lean.Compiler.Options
+ import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
+ import Lean.Linter.PersistentLintLog
+ import Lean.Util.ProfilerServer
++import Lean.Meta.Tactic.LibrarySearch  -- search index: `recordModuleIndex`
+ 
+ public section
+ 
+@@ -382,6 +383,8 @@ def runFrontend
+     profileitIO ".olean serialization" finalOpts do
+       let commandLints := collectCommandLints snaps none #[]
+       let env ← Linter.recordLints inputCtx.fileMap env commandLints
++      -- Search index: store the library-search index entries of this module
++      let env ← Meta.LibrarySearch.recordModuleIndex env finalOpts
+       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+ 
+   if let some ileanFileName := ileanFileName? then
+diff --git a/src/Lean/Environment.lean b/src/Lean/Environment.lean
+index 3392851..ef7945d 100644
+--- a/src/Lean/Environment.lean
++++ b/src/Lean/Environment.lean
+@@ -175,6 +175,19 @@ structure EnvironmentHeader where
+   moduleData   : Array ModuleData := #[]
+   deriving Nonempty
+ 
++/--
++Lazy parts: reserved key under which `EnvironmentHeader.moduleName2Idx` stores the identifier
++(index + 1) of the environment's lazy-loading state in `lazyPartsRegistry`. Stored there (rather
++than in a new field) so that the object layout of `EnvironmentHeader` is unchanged, which keeps
++the stage-0 compiler
++and the stage-1 code interoperable during bootstrapping.
++-/
++def lazyPartsIdKey : Name := `_lazyParts.id
++
++/-- Lazy parts: the lazy-loading state id of this environment; `0` when nothing is loaded lazily. -/
++@[inline] def EnvironmentHeader.lazyPartsId (h : EnvironmentHeader) : Nat :=
++  (h.moduleName2Idx[lazyPartsIdKey]?.map (·.toNat)).getD 0
++
+ /--
+ Name of all imported modules (directly and indirectly).
+ The index of a module name in the array equals the `ModuleIdx` for the same module.
+@@ -182,6 +195,685 @@ The index of a module name in the array equals the `ModuleIdx` for the same modu
+ def EnvironmentHeader.moduleNames (header : EnvironmentHeader) : Array Name :=
+   header.modules.map (·.module)
+ 
++/--
++`a[i]`, but implemented so that the element's reference count is *not* read when the element is an
++object of a memory-mapped compacted region (`lean_array_fget_no_touch`, `src/runtime/object.cpp`).
++
++Objects in compacted regions are persistent (`rc = 0`); `inc`/`dec` on them are no-ops whose only
++effect is to read the object header, i.e. to fault in the page of the `.olean` file that holds the
++object. `finalizeImport` only *stores* the `ConstantInfo` pointers of the imported modules into the
++constant maps, so with the ordinary `a[i]` (which increments the reference count of the returned
++element) a `import Mathlib` touches the page of every one of ~770k `ConstantInfo` objects, scattered
++over the whole ~7 GB of mapped files, although no proof or type is ever looked at. This primitive
++checks membership in a compacted region by address (the loader registers the address ranges it maps
++regions into) and skips the increment in that case; for every other element it behaves exactly like
++`a[i]`. The result is owned, as with `a[i]`.
++-/
++@[extern "lean_array_fget_no_touch"]
++private unsafe def getPersistentElemUnsafe (a : @& Array α) (i : @& Nat) (h : i < a.size) : α :=
++  a[i]
++
++@[implemented_by getPersistentElemUnsafe]
++private def getPersistentElem (a : @& Array α) (i : @& Nat) (h : i < a.size) : α :=
++  a[i]
++
++/-!
++## Lazy parts: lazy loading of `.olean.private` and `.ir` parts for legacy (non-`module`) roots
++
++A root file without `module` imports every module at the `.private` level: the constant map is
++built from the `.olean.private` parts (private declarations, proof bodies, unexposed definition
++bodies) and the interpreter needs the `.ir` parts. Stock Lean maps all five files of every module
++eagerly. Here, `importModulesCore` reads only the `.olean` parts; `finalizeImport` then either
++loads the other parts eagerly (`LEAN_LAZY_PARTS=0`, or when no index is available) or registers them for
++on-demand loading:
++
++* `.ir` (`LEAN_LAZY_PARTS=ir` or `all`): loaded when the interpreter first asks for IR of that module
++  (`getModuleIREntries` of `Lean.IR.declMapExt`).
++* `.olean.private` (`LEAN_LAZY_PARTS=all`, the default): loaded when a constant of the module is looked up
++  whose exported `ConstantInfo` differs from the private one (a theorem/definition weakened to an
++  axiom), when a private-only name of the module is looked up, or when an extension in
++  `lazyPartsLazyExtNames` (extensions whose entries are only ever read per module) reads the module's
++  entries.
++
++What a legacy root needs *eagerly* but which only exists in the deferred parts — the code
++generator's auxiliary names (`extraConstNames`, for `const2ModIdx`), the `[init]` declarations, the
++names of private-only constants (for `const2ModIdx`) and the private-level entries of extensions
++whose `addImportedFn` consumes entries at import — is taken from an index file that is generated on
++the first (eager) import of a given module closure and cached in `$LEAN_LAZY_PARTS_INDEX_DIR`
++(default `~/.cache/lean-lazy-parts`). A production version would store this data in the eagerly loaded
++part of the module instead.
++-/
++
++/-- Per-module contents of the lazy-parts index. -/
++structure LazyPartsModIndex where
++  /-- `ModuleData.extraConstNames` of the `.ir` part. -/
++  extraConstNames  : Array Name := #[]
++  /-- Entries of the `.ir` part other than `Lean.IR.declMapExt` (`[init]` declarations, package). -/
++  irEntries        : Array (Name × Array EnvExtensionEntry) := #[]
++  /-- Names in the `.olean.private` constant table that are not in the `.olean` one. -/
++  privOnlyNames    : Array Name := #[]
++  /--
++  Indices into the `.olean` constant arrays in the order of the `.olean.private` constant table
++  (declaration order), so that `header.moduleData` lists the constants in the same order as stock
++  (`LazyDiscrTree`/`exact?` results depend on it).
++  -/
++  privOrder        : Array Nat := #[]
++  /--
++  Private-level entry arrays (copied) of extensions not in `lazyPartsLazyExtNames` that differ from the
++  exported-level ones; they replace the exported-level arrays in `ModuleData.entries`.
++  -/
++  privEagerEntries : Array (Name × Array EnvExtensionEntry) := #[]
++  deriving Inhabited
++
++/-- The lazy-parts index of a module closure (in `ModuleIdx` order). -/
++structure LazyPartsIndex where
++  moduleNames : Array Name := #[]
++  mods        : Array LazyPartsModIndex := #[]
++  deriving Inhabited
++
++/-- Lazy parts: per-module description of the parts that can be loaded on demand. -/
++structure LazyPartsLazyMod where
++  /-- `.olean.server`, `.olean.private` (chained on `privDeps`). -/
++  privFiles : Array System.FilePath := #[]
++  privDeps  : Array CompactedRegion := #[]
++  /-- `.ir.sig`, `.ir`. -/
++  irFiles   : Array System.FilePath := #[]
++  deriving Inhabited
++
++/-- Lazy parts: mutable lazy-loading state of one environment (kept outside the environment object, which
++is marked persistent). -/
++structure LazyPartsState where
++  lazyPrivate  : Bool := false
++  verbose      : Bool := false
++  moduleNames  : Array Name := #[]
++  mods         : Array LazyPartsLazyMod := #[]
++  /-- The eagerly built constant map (exported data), for duplicate resolution. -/
++  exported     : Std.HashMap Name ConstantInfo := {}
++  /-- Per module, the entries of its `.olean.private` part once loaded. -/
++  privEntries  : Array (Option (Std.HashMap Name (Array EnvExtensionEntry))) := #[]
++  /-- Per module, the entries of its `.ir` part once loaded. -/
++  irEntries    : Array (Option (Std.HashMap Name (Array EnvExtensionEntry))) := #[]
++  /-- Constants of the loaded `.olean.private` parts. -/
++  overlay      : PHashMap Name ConstantInfo := {}
++  numOverlay   : Nat := 0
++  /-- Regions loaded on demand (never freed; the frontend leaks the environment anyway). -/
++  regions      : Array CompactedRegion := #[]
++  numPrivLoads : Nat := 0
++  numIRLoads   : Nat := 0
++  deriving Inhabited
++
++builtin_initialize lazyPartsRegistry : IO.Ref (Array (IO.Ref LazyPartsState)) ← IO.mkRef #[]
++
++/--
++Extensions whose imported entries are consumed only per module through `getModuleEntries`
++(their `addImportedFn` ignores the entries), so that the private-level entries can be served on
++demand from the `.olean.private` part. Every other extension with private-level entries that differ
++from the exported ones gets the private arrays from the index at import time. `declMetaExt` is
++deliberately *not* in this list although it is lazy: `getIRPhases` consults it for every constant
++the interpreter evaluates, which would load the private part of every module with an initializer
++or a parser at import time.
++-/
++private def lazyPartsLazyExtNames : Std.HashMap Name Unit :=
++  let priv (mod n : Name) : Name := (Name.mkNum (`_private ++ mod) 0) ++ n
++  [`Lean.Compiler.LCNF.impureSigExt, `Lean.Compiler.LCNF.monoExt, `Lean.Compiler.LCNF.baseExt,
++   `Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt,
++   priv `Lean.ExtraModUses `Lean.extraModUses,
++   `Lean.declRangeExt, `Lean.docStringExt, `Lean.versoDocStringExt,
++   priv `Lean.DocString.Extension `Lean.moduleDocExt,
++   priv `Lean.DocString.Extension `Lean.inheritDocStringExt,
++   priv `Lean.DocString.Extension `Lean.versoModuleDocExt,
++   `Lean.Compiler.inlineAttrs, `Lean.Compiler.nospecializeAttr, `Lean.matchPatternAttr,
++   priv `Lean.Meta.Constructions.SparseCasesOn `Lean.Meta.sparseCasesOnInfoExt,
++   `Lean.Elab.Structural.eqnInfoExt, `Lean.Elab.WF.eqnInfoExt].foldl (·.insert · ()) {}
++
++private def lazyPartsDeclMapExtName : Name := `Lean.IR.declMapExt
++
++/-- `0`: everything eager (stock part loading); `1`: lazy `.ir`; `2`: lazy `.ir` and `.olean.private`. -/
++private def lazyPartsMode : IO Nat := do
++  match ← IO.getEnv "LEAN_LAZY_PARTS" with
++  | some "0" | some "off" => return 0
++  | some "ir" => return 1
++  | _ => return 2
++
++private def lazyPartsIndexDir : IO (Option System.FilePath) := do
++  if let some d ← IO.getEnv "LEAN_LAZY_PARTS_INDEX_DIR" then return some d
++  if let some h ← IO.getEnv "HOME" then return some (System.FilePath.mk h / ".cache" / "lean-lazy-parts")
++  return none
++
++
++/-!
++### Bounding the lazy-parts index directory
++
++Lazy parts keeps a directory of index files keyed on the import closure, and never deleted one. That is
++harmless when a project's files share a handful of headers — a 1,373-file project presents 213
++distinct closures and the directory converges — and it is a disk-filling defect when every
++compilation unit has its own closure, which is exactly the shape of a library build *from source*.
++
++(The tactic index used to keep such a directory too, and was much the worse offender: a from-source Mathlib
++build wrote 255 GiB of images to answer 216 lookups. It no longer writes anything at runtime — its
++image is a *shipped artefact*, built on request and only ever read at run time. See the tactic-index section
++below. These bounds are therefore the lazy-parts index's alone; the helpers stay generic because the shape — a keyed
++directory of large files — is not specific to lazy parts.)
++
++Three bounds, each configurable, each off the fast path:
++
++* a **free-space floor** (`LEAN_LAZY_PARTS_MIN_FREE`, default 10 GB): below it no new file is written, but
++  existing files are still read. One `statfs` per write attempt (a few microseconds against a write
++  that costs hundreds of milliseconds), so there is nothing to memoise;
++* a **size cap with LRU eviction** (`LEAN_LAZY_PARTS_MAX_SIZE`, default 5 GB — the figure `ccache` and
++  Gradle's build cache have used for caches of this shape, a convention rather than a measured
++  optimum). Enforced after each write by one `readDir` plus one `stat` per file;
++* an **admission threshold** (`LEAN_LAZY_PARTS_MIN_USES`, default **1**), the analogue of nginx's
++  `proxy_cache_min_uses`: a closure must have been seen this many times before its index is
++  written. At the default of 1 nothing changes — the first miss writes, as before. At 2 a
++  from-source build writes one empty marker file per closure and no indexes at all, because no
++  closure there ever recurs; the price is that a project whose files *do* share headers loses the
++  index on the first sighting of each closure, which is why 1 and not 2 is the default.
++
++Recency for the LRU is the newest mtime in the entry's group of files: the payload
++(`index-<key>.lazyparts`) and a one-byte `.used` stamp rewritten on every hit (~30 µs, against an import
++the index exists to make seconds faster).
++-/
++
++/--
++Free space in bytes on the filesystem holding `path`; `0` when the question cannot be answered,
++which every caller reads as "unknown, do not block".
++-/
++@[extern "lean_io_free_disk_space"]
++private opaque cacheFreeSpaceOf (path : @& String) : IO UInt64
++
++/-- The three bounds on a side-cache directory. `0` disables a bound. -/
++structure CacheBound where
++  /-- Stop writing when free space on the cache's filesystem is below this many bytes. -/
++  minFree : UInt64 := 0
++  /-- Evict least-recently-used entries to keep the directory below this many bytes. -/
++  maxSize : UInt64 := 0
++  /-- Write an entry only once its key has been seen this many times. -/
++  minUses : Nat := 1
++  deriving Inhabited
++
++private def cacheDigits (cs : List Char) : Nat :=
++  cs.foldl (fun a c => a * 10 + (c.toNat - '0'.toNat)) 0
++
++/-- `12`, `512K`, `10M`, `5G` (also `KB`/`MB`/`GB`, case-insensitive). `none` if unparsable. -/
++private def cacheParseSize (s : String) : Option UInt64 := Id.run do
++  let cs := s.toList.filter (!·.isWhitespace)
++  let digits := cs.takeWhile Char.isDigit
++  if digits.isEmpty then return none
++  let n := cacheDigits digits
++  let unit := String.ofList ((cs.drop digits.length).map Char.toLower)
++  let mult : Option Nat := match unit with
++    | "" | "b"          => some 1
++    | "k" | "kb" | "kib" => some 1024
++    | "m" | "mb" | "mib" => some (1024 * 1024)
++    | "g" | "gb" | "gib" => some (1024 * 1024 * 1024)
++    | "t" | "tb" | "tib" => some (1024 * 1024 * 1024 * 1024)
++    | _                  => none
++  match mult with
++  | none   => return none
++  | some m => return some (UInt64.ofNat (n * m))
++
++private def cacheReadBound (pfx : String) (defMinFree defMaxSize : UInt64) : IO CacheBound := do
++  let readSize (suffix : String) (dflt : UInt64) : IO UInt64 := do
++    match ← IO.getEnv (pfx ++ suffix) with
++    | none   => return dflt
++    | some v => return (cacheParseSize v).getD dflt
++  let minFree ← readSize "_MIN_FREE" defMinFree
++  let maxSize ← readSize "_MAX_SIZE" defMaxSize
++  let minUses ← match ← IO.getEnv (pfx ++ "_MIN_USES") with
++    | none   => pure 1
++    | some v =>
++      let ds := v.toList.filter (!·.isWhitespace)
++      pure (if ds.isEmpty || !ds.all Char.isDigit then 1 else cacheDigits ds)
++  return { minFree, maxSize, minUses }
++
++/-- Default bounds: a 10 GB free-space floor and a 5 GB directory cap. -/
++private def cacheDefaultMinFree : UInt64 := 10 * 1024 * 1024 * 1024
++private def cacheDefaultMaxSize : UInt64 := 5 * 1024 * 1024 * 1024
++
++/--
++Blocks a filesystem hands out even for a one-byte file. Marker files are one byte of payload and
++one block of disk, and it is the blocks that fill a disk, so the cap accounts for every file at
++`max(size, cacheBlockBytes)`.
++-/
++private def cacheBlockBytes : UInt64 := 4096
++
++/-- True if there is room to write; `false` only when the floor is set and the disk is below it. -/
++private def cacheFloorOk (dir : System.FilePath) (b : CacheBound) : IO Bool := do
++  if b.minFree == 0 then return true
++  let free ← try cacheFreeSpaceOf dir.toString catch _ => pure 0
++  -- `0` means the query failed: unknown is not a reason to stop writing.
++  return free == 0 || free ≥ b.minFree
++
++/--
++Opt-in accounting. With `LEAN_CACHE_STATS=<file>` every decision appends one short line to that
++file; concurrent `O_APPEND` writes of a few bytes do not interleave, so a whole build's activity
++can be counted afterwards. Unset — the default — this costs one `getenv`.
++-/
++private def cacheStats (line : String) : IO Unit := do
++  if let some f ← IO.getEnv "LEAN_CACHE_STATS" then
++    try
++      let h ← IO.FS.Handle.mk f .append
++      h.putStr (line ++ "\n")
++    catch _ => pure ()
++
++/-- Rewrites the one-byte `.used` stamp beside `path`, which is the entry's LRU recency. -/
++private def cacheTouch (path : System.FilePath) : IO Unit := do
++  try IO.FS.writeBinFile (path.addExtension "used") ⟨#[0]⟩ catch _ => pure ()
++
++/-- `SystemTime`'s `<` is a `Prop`; the LRU sort needs a `Bool`. -/
++private def cacheTimeLt (a b : IO.FS.SystemTime) : Bool :=
++  a.sec < b.sec || (a.sec == b.sec && a.nsec < b.nsec)
++
++private structure CacheEntry where
++  base    : String
++  files   : Array System.FilePath := #[]
++  bytes   : UInt64 := 0
++  modified : IO.FS.SystemTime := ⟨0, 0⟩
++
++/--
++Enforces the size cap: one `readDir` plus one `stat` per file, then removal of whole entries
++oldest-first until the total is under the cap. Files belonging to a write in flight (`.tmp<pid>`,
++`.probe<pid>`) are skipped, and every removal is best-effort — a loser of a race just finds the
++file gone. Unlinking a file another process has mapped is safe on POSIX; on Windows it fails and
++is ignored. Returns the number of entries evicted, the bytes they held, and the total afterwards.
++-/
++private def cacheEnforceCap (dir : System.FilePath) (b : CacheBound) :
++    IO (Nat × UInt64 × UInt64) := do
++  if b.maxSize == 0 then return (0, 0, 0)
++  let entries ← try dir.readDir catch _ => pure #[]
++  let mut groups : Std.HashMap String CacheEntry := {}
++  for e in entries do
++    let name := e.fileName
++    -- skip another process's temporaries (`<file>.tmp<pid>`, `<file>.probe<pid>`)
++    let ext := (System.FilePath.mk name).extension.getD ""
++    if ext.startsWith "tmp" || ext.startsWith "probe" then continue
++    let base :=
++      if name.endsWith ".used" || name.endsWith ".deps" then (name.dropEnd 5).toString else name
++    let md ← try pure (some (← e.path.metadata)) catch _ => pure none
++    let some md := md | continue
++    unless md.type == .file do continue
++    let g := groups.getD base { base }
++    groups := groups.insert base
++      { g with
++        files := g.files.push e.path
++        bytes := g.bytes + max md.byteSize cacheBlockBytes
++        modified := if cacheTimeLt g.modified md.modified then md.modified else g.modified }
++  let mut total : UInt64 := 0
++  for (_, g) in groups do
++    total := total + g.bytes
++  if total ≤ b.maxSize then return (0, 0, total)
++  let mut arr := groups.toArray.map (·.2)
++  arr := arr.qsort fun a b => cacheTimeLt a.modified b.modified
++  let mut evicted := 0
++  let mut freed : UInt64 := 0
++  for g in arr do
++    if total ≤ b.maxSize then break
++    for f in g.files do
++      try IO.FS.removeFile f catch _ => pure ()
++    total := total - min total g.bytes
++    freed := freed + g.bytes
++    evicted := evicted + 1
++  return (evicted, freed, total)
++
++/--
++Admission (`min_uses`). Returns `true` if this sighting of `key` may write the payload. At
++`minUses ≤ 1` this is unconditionally `true` and no marker is created, so the default costs
++nothing and behaves exactly as before. Otherwise `<markerPfx><key>` records one byte per sighting
++and its size is the count.
++
++Markers are the only thing a `min_uses ≥ 2` run writes, so the cap has to reach them too; but a
++scan per marker would be quadratic in the number of closures, so one marker write in 64 (chosen by
++the key's hash) enforces it. That keeps the cost at 1/64 of a scan per miss and still bounds the
++directory.
++-/
++private def cacheAdmit (dir : System.FilePath) (markerPfx : String) (key : String)
++    (b : CacheBound) : IO Bool := do
++  if b.minUses ≤ 1 then return true
++  let p := dir / (markerPfx ++ key)
++  let seen ← try pure (← p.metadata).byteSize.toNat catch _ => pure 0
++  if seen + 1 ≥ b.minUses then return true
++  try
++    IO.FS.createDirAll dir
++    let h ← IO.FS.Handle.mk p .append
++    h.write ⟨#[0]⟩
++    if hash key % 64 == 0 then
++      let _ ← cacheEnforceCap dir b
++  catch _ => pure ()
++  return false
++
++/-!
++### Tactic index: a shipped image of the eager extension indexes
++
++`finalizePersistentExtensions` runs every persistent extension's `addImportedFn` at every start;
++for the *eager* (scoped) ones this rebuilds an in-heap index — `simp`'s `DiscrTree` (99,657
++entries), the instance `DiscrTree` (43,515), the LCNF specialization cache, `grind`, the
++match-equation table, Mathlib's `to_additive`/`fun_prop`/`gcongr`/`norm_num`/`positivity` tables —
++from data that has not changed since the last start.
++
++The tactic index puts those states into **one compacted region per import closure** whose dependency regions are
++the closure's `.olean` regions, so nothing that already lives in an `.olean` is copied. When such an
++image is present, the import memory-maps it and installs each state as the extension's imported
++state instead of running `addImportedFn`. The installed value is the compacted image of exactly the
++object graph the eager path builds, so `simp`'s `DiscrTree` has the same shape and the same per-key
++insertion order by construction.
++
++**The two halves are separate, and only reading is automatic.**
++
++* *Reading* is what every ordinary run does: look for `exts-<key>.tacticindex` in the image directory, and
++  if it is there and its key matches, map it. If it is absent, mismatched or unreadable, the import
++  rebuilds the indexes exactly as stock Lean does. A run never writes, never creates a directory
++  and never evicts anything.
++* *Writing* happens only when `LEAN_TACTIC_INDEX_WRITE` is set, which is a deliberate act by whoever
++  distributes a library — Mathlib's CI next to `lake exe cache`, or a user once for the header they
++  work under. It is the same probe-and-save the cache used to run automatically on every miss.
++
++An earlier revision wrote on every miss, into `$HOME/.cache/lean-tactic-index`. That made it a cache,
++and every problem it had was a cache problem: a from-source Mathlib build wrote 255 GiB of images
++to answer 216 lookups, and the size cap and admission threshold added to bound it could not be given
++defensible defaults (one of them cost 19 % on a real project). The measured *benefit*, meanwhile,
++is confined to one workload — a fixed import line, one closure, one image. Serving that with a
++prebuilt artefact keeps the benefit and deletes the policy.
++
++**Where the image lives.** By default, in the directory of the topmost module's `.olean` — i.e. the
++`lib/lean` directory of the library that owns the closure (`.lake/build/lib/lean` for a Lake
++package). An image is valid for exactly one (toolchain, library revision) pair, which is the same
++thing an olean cache is keyed on, so it belongs in the same place and travels the same way.
++`LEAN_TACTIC_INDEX_DIR` overrides that, for reading and for writing alike, for anyone who prefers to
++stage images elsewhere.
++
++**Why a stale image cannot be used.** The image's dependency regions *are* the `.olean` regions it
++was built against; `CompactedRegion.read` fails if they do not match, and the key stored inside the
++image (closure module names in `ModuleIdx` order, every region's path and size, and the number of
++imported entries every extension sees) is re-checked against the key computed now. Either check
++failing means the image is ignored and the indexes are rebuilt — a slow correct run, not a wrong
++answer.
++
++Switches: `LEAN_TACTIC_INDEX=0` (off, stock behaviour), `LEAN_TACTIC_INDEX_DIR=<dir>` (where images are read
++from and written to), `LEAN_TACTIC_INDEX_WRITE=1` (build and write the image for this closure, then
++continue), `LEAN_TACTIC_INDEX_VERBOSE=1`. `LEAN_CACHE_STATS=<file>` appends one `tactic-index hit|miss|write <key>`
++line per import, which is how a distributor learns which closures its users present.
++
++Inside `finalizePersistentExtensions` — upstream code — the whole feature is one branch.
++-/
++
++/-- Tactic index: extensions that are never put into an image (their states hold evaluated closures). -/
++private def tacticIndexNeverDefer : Std.HashMap Name Unit :=
++  #[`Lean.regularInitAttr, `Lean.builtinInitAttr, `Lean.Parser.parserExtension,
++    `Lean.Elab.macroAttribute, `Lean.Elab.Term.termElabAttribute, `Lean.Elab.Command.commandElabAttribute,
++    `Lean.Elab.Tactic.tacticElabAttribute, `Lean.attributeExtension].foldl (·.insert · ()) {}
++
++/-- Tactic index: the format version of the extension-state image; bump on any change of what is stored. -/
++private def tacticIndexImageVersion : UInt64 := 1
++
++/-- Tactic index: extension states whose compacted image is smaller than this are not worth mapping. -/
++private def tacticIndexMinStateBytes : UInt64 := 4096
++
++/-- Tactic index: the root object of an image file. -/
++structure TacticIndexImage where
++  key         : UInt64 := 0
++  moduleNames : Array Name := #[]
++  extNames    : Array Name := #[]
++  states      : Array EnvExtensionState := #[]
++  deriving Inhabited
++
++/--
++Tactic index: image regions kept alive for the lifetime of the process. The environment is leaked anyway
++(`leakEnv`), and the states installed from an image point into its region, so it must never be
++unmapped. It is deliberately *not* added to `EnvironmentHeader.regions`: that array is the
++dependency list used to save and load the image, and must be the same on both sides.
++-/
++private builtin_initialize tacticIndexRegions : IO.Ref (Array CompactedRegion) ← IO.mkRef #[]
++
++/--
++Tactic index: image key. Covers the closure (module names in `ModuleIdx` order), the identity of every
++mapped region (path and size — the size comes from the `fstat` of *this* process, so it is current)
++and the number of imported entries the imaged extensions see (which reflects the lazy-parts mode and any
++change of attribute data). It is both the file name and a field of the image, so a mismatched
++image is rejected rather than installed.
++-/
++private def tacticIndexKey (moduleNames : Array Name) (regions : Array CompactedRegion)
++    (extEntryCounts : Array (Name × Nat)) : UInt64 := Id.run do
++  let mut h : UInt64 := mixHash 11 tacticIndexImageVersion
++  h := mixHash h (hash moduleNames.size)
++  for n in moduleNames do
++    h := mixHash h n.hash
++  for r in regions do
++    h := mixHash (mixHash h (hash r.filePath.toString)) (hash r.size.toNat)
++  for (n, c) in extEntryCounts do
++    h := mixHash (mixHash h n.hash) (hash c)
++  return h
++
++private unsafe def tacticIndexLoadImage (path : System.FilePath) (deps : Array CompactedRegion)
++    (verbose := false) : IO (Option (TacticIndexImage × CompactedRegion)) := do
++  unless ← path.pathExists do return none
++  try
++    return some (← CompactedRegion.read (α := TacticIndexImage) path deps)
++  catch e =>
++    if verbose then IO.eprintln s!"tactic-index: image {path} not readable ({deps.size} deps): {e}"
++    return none
++
++/--
++Tactic index: the dependency-region list is stored next to the image as one byte per region of
++`EnvironmentHeader.regions` (in order), because it must be reconstructed *before* the image itself
++can be read.
++
++Only regions that landed at their saved address are used as dependencies: `region_reader` takes
++its fast path — no pointer fixup, no page of the image touched — only when the image itself and
++*every* dependency region is at its saved address, and a Mathlib import has ~38 regions that
++collide and fall back to `read()`. Objects the imaged states hold in those few regions are copied
++into the image instead.
++-/
++private def tacticIndexDepsPath (path : System.FilePath) : System.FilePath := path.addExtension "deps"
++
++private def tacticIndexWriteDeps (path : System.FilePath) (regions : Array CompactedRegion) : IO Unit :=
++  IO.FS.writeBinFile (tacticIndexDepsPath path)
++    ⟨regions.map fun r => (if r.isMemoryMapped then 1 else 0 : UInt8)⟩
++
++/--
++`none` when there is no usable sidecar — the file is missing, or it does not have one byte per
++region of this closure. That is *not* the same as an empty dependency list: an image read with the
++wrong dependencies can still succeed, because the fast path performs no fixup at all, and then the
++cross-region pointers it hands back are only correct by the accident of every region having landed
++at its saved address. An image without its matching sidecar must not be used.
++-/
++private def tacticIndexReadDeps (path : System.FilePath) (regions : Array CompactedRegion) :
++    IO (Option (Array CompactedRegion)) := do
++  let p := tacticIndexDepsPath path
++  unless ← p.pathExists do return none
++  let bs ← IO.FS.readBinFile p
++  if bs.size != regions.size then return none
++  return some <| regions.zipIdx.filterMap fun (r, i) => if bs[i]! == 1 then some r else none
++
++/--
++Tactic index: write the image and its sidecar, and verify that they read back.
++
++`CompactedRegion.save` derives a region's saved base address from a hash of the `key` name it is
++given, and `region_reader` refuses an image whose saved range overlaps a dependency's saved range
++(it could not then tell which region a pointer belongs to). A 212 MB image against ~10,500 olean
++dependencies hits that on the order of one name in sixty, and it is a property of the *saved*
++addresses, so a name that collides collides in every reader, for ever. A distributor must not ship
++an image nobody can read: try `_tacticIndexImage0`, `_tacticIndexImage1`, … until the image reads back through the
++reader's own path, and delete the file rather than leave an unusable one behind. (The name is not
++recorded anywhere — `CompactedRegion.read` takes the base address from the file header — so the
++reader neither knows nor needs to know which attempt succeeded.)
++-/
++private unsafe def tacticIndexSaveImage (path : System.FilePath) (deps regions : Array CompactedRegion)
++    (c : TacticIndexImage) (verbose := false) : IO Bool := do
++  if let some dir := path.parent then IO.FS.createDirAll dir
++  for attempt in *...8 do
++    let tmp := path.addExtension s!"tmp{← IO.Process.getPID}"
++    try
++      let _ ← CompactedRegion.save tmp (Name.mkSimple s!"_tacticIndexImage{attempt}") c deps none
++      IO.FS.rename tmp path
++    catch e =>
++      try IO.FS.removeFile tmp catch _ => pure ()
++      throw e
++    tacticIndexWriteDeps path regions
++    if let some deps ← tacticIndexReadDeps path regions then
++      if (← tacticIndexLoadImage path deps verbose).isSome then
++        return true
++    if verbose then
++      IO.eprintln s!"tactic-index: base address of `_tacticIndexImage{attempt}` collides with a dependency; retrying"
++  try IO.FS.removeFile path catch _ => pure ()
++  try IO.FS.removeFile (tacticIndexDepsPath path) catch _ => pure ()
++  return false
++
++/-- Reads `fnames` as a chain of parts continuing the already loaded `deps`. -/
++private def lazyPartsReadPartsWithDeps (fnames : Array System.FilePath) (deps : Array CompactedRegion) :
++    IO (Array (ModuleData × CompactedRegion)) := do
++  let mut depRegions := deps
++  let mut result := #[]
++  for fname in fnames do
++    let part ← unsafe CompactedRegion.read (α := ModuleData) fname depRegions
++    result := result.push part
++    depRegions := depRegions.push part.2
++  return result
++
++private def lazyPartsEntriesMap (data : ModuleData) : Std.HashMap Name (Array EnvExtensionEntry) :=
++  data.entries.foldl (init := Std.HashMap.emptyWithCapacity data.entries.size) fun m (n, es) =>
++    m.insert n es
++
++/-- `subsumesInfo` with an arbitrary lookup function. -/
++private def lazyPartsSubsumes (find? : Name → Option ConstantInfo) (cinfo₁ cinfo₂ : ConstantInfo) : Bool :=
++  cinfo₁.name == cinfo₂.name &&
++    cinfo₁.type == cinfo₂.type &&
++    cinfo₁.levelParams == cinfo₂.levelParams &&
++    match cinfo₁, cinfo₂ with
++    | .thmInfo tval₁, .thmInfo tval₂ => tval₁.all == tval₂.all
++    | .thmInfo tval₁, .axiomInfo aval₂ => tval₁.all == [aval₂.name] && !aval₂.isUnsafe
++    | .axiomInfo aval₁, .axiomInfo aval₂ => aval₁.isUnsafe == aval₂.isUnsafe && isPropCheap aval₁.type
++    | _, _ => false
++where
++  isPropCheap (ty : Expr) : Bool := Id.run do
++    let mut ty := ty
++    while ty.isForall do
++      let .forallE (body := body) .. := ty | return false
++      ty := body
++    let .const n .. := ty.getAppFn | return false
++    let some decl := find? n | return false
++    let mut p := decl.type
++    for _ in 0...ty.getAppNumArgs do
++      let .forallE (body := body) .. := p | return false
++      p := body
++    p.isProp
++
++/-- Loads module `m`'s `.olean.server`/`.olean.private` parts and merges its constants and entries. -/
++private def lazyPartsLoadPriv (ref : IO.Ref LazyPartsState) (m : Nat) (reason : Name) : IO Unit := do
++  let s ← ref.get
++  if (s.privEntries[m]?.getD none).isSome then return
++  let some mod := s.mods[m]? | return
++  if mod.privFiles.isEmpty then return
++  if s.verbose then IO.eprintln s!"lazy-parts: loading private part of {s.moduleNames[m]!} (for {reason})"
++  let parts ← lazyPartsReadPartsWithDeps mod.privFiles mod.privDeps
++  let some (priv, _) := parts.back? | return
++  let emap := lazyPartsEntriesMap priv
++  ref.modify fun s => Id.run do
++    if (s.privEntries[m]?.getD none).isSome then return s  -- lost a race; keep the first load
++    let base := s.overlay
++    let exported := s.exported
++    let find? (n : Name) : Option ConstantInfo := base.find? n <|> exported[n]?
++    let mut overlay := s.overlay
++    let mut numOverlay := s.numOverlay
++    for h : i in *...(min priv.constNames.size priv.constants.size) do
++      have hc : i < priv.constants.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_right ..)
++      have hn : i < priv.constNames.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_left ..)
++      let cname := priv.constNames[i]
++      match overlay.find? cname with
++      | none =>
++        overlay := overlay.insert cname (getPersistentElem priv.constants i hc)
++        numOverlay := numOverlay + 1
++      | some cinfoPrev =>
++        -- duplicate constant (e.g. an equation theorem realized in two modules), rare
++        let cinfo := priv.constants[i]
++        if lazyPartsSubsumes find? cinfo cinfoPrev then
++          overlay := overlay.insert cname cinfo
++    return { s with
++      overlay
++      numOverlay
++      privEntries := s.privEntries.set! m (some emap)
++      regions := s.regions ++ parts.map (·.2)
++      numPrivLoads := s.numPrivLoads + 1 }
++
++/-- Loads module `m`'s `.ir.sig`/`.ir` parts. -/
++private def lazyPartsLoadIR (ref : IO.Ref LazyPartsState) (m : Nat) (reason : Name) : IO Unit := do
++  let s ← ref.get
++  if (s.irEntries[m]?.getD none).isSome then return
++  let some mod := s.mods[m]? | return
++  if mod.irFiles.isEmpty then return
++  if s.verbose then IO.eprintln s!"lazy-parts: loading IR of {s.moduleNames[m]!} (for {reason})"
++  let parts ← lazyPartsReadPartsWithDeps mod.irFiles #[]
++  let some (ir, _) := parts.back? | return
++  let emap := lazyPartsEntriesMap ir
++  ref.modify fun s =>
++    if (s.irEntries[m]?.getD none).isSome then s
++    else { s with
++      irEntries := s.irEntries.set! m (some emap)
++      regions := s.regions ++ parts.map (·.2)
++      numIRLoads := s.numIRLoads + 1 }
++
++private def lazyPartsGetState (lazyId : Nat) : BaseIO (Option (IO.Ref LazyPartsState)) := do
++  return (← lazyPartsRegistry.get)[lazyId - 1]?
++
++private unsafe def lazyPartsModuleEntriesImpl (lazyId : Nat) (extName : Name) (m : Nat) (ir : Bool) :
++    Option (Array EnvExtensionEntry) := unsafeBaseIO do
++  let some ref ← lazyPartsGetState lazyId | return none
++  let s ← ref.get
++  let some mod := s.mods[m]? | return none
++  if ir then
++    -- only `declMapExt` lives exclusively in the `.ir` part; the other IR entries come from the index
++    if mod.irFiles.isEmpty || extName != lazyPartsDeclMapExtName then return none
++    if (s.irEntries[m]?.getD none).isNone then
++      let _ ← (lazyPartsLoadIR ref m extName).toBaseIO
++    let s ← ref.get
++    return some (((s.irEntries[m]?.getD none).bind (·[extName]?)).getD #[])
++  else
++    if !s.lazyPrivate || mod.privFiles.isEmpty || !lazyPartsLazyExtNames.contains extName then return none
++    if (s.privEntries[m]?.getD none).isNone then
++      let _ ← (lazyPartsLoadPriv ref m extName).toBaseIO
++    let s ← ref.get
++    return some (((s.privEntries[m]?.getD none).bind (·[extName]?)).getD #[])
++
++private unsafe def lazyPartsResolveConstImpl (lazyId : Nat) (const2ModIdx : Std.HashMap Name ModuleIdx)
++    (n : Name) (c? : Option ConstantInfo) : Option ConstantInfo := unsafeBaseIO do
++  let some ref ← lazyPartsGetState lazyId | return c?
++  let s ← ref.get
++  if !s.lazyPrivate then return c?
++  if let some c := s.overlay.find? n then return some c
++  -- Every exported `ConstantInfo` other than a weakened one is the same object as the private one.
++  let needLoad := match c? with
++    | some (.axiomInfo _) => true
++    | some _ => false
++    | none => true
++  if !needLoad then return c?
++  let some m := const2ModIdx[n]?.map (·.toNat) | return c?
++  if (s.privEntries[m]?.getD none).isNone then
++    let _ ← (lazyPartsLoadPriv ref m n).toBaseIO
++  let s ← ref.get
++  return s.overlay.find? n <|> c?
++
++/--
++Lazy parts: entries of extension `extName` for module `m` served from a lazily loaded part
++(`.olean.private` when `ir = false`, `.ir` when `ir = true`), loading the part on first use;
++`none` means "use the eagerly imported entries".
++-/
++@[implemented_by lazyPartsModuleEntriesImpl]
++private def lazyPartsModuleEntries (lazyId : Nat) (extName : Name) (m : Nat) (ir : Bool) :
++    Option (Array EnvExtensionEntry) :=
++  let _ := (lazyId, extName, m, ir)
++  none
++
++/--
++Lazy parts: given the result `c?` of a lookup of `n` in the eagerly built constant map, returns the
++constant as it would have been found had all `.olean.private` parts been imported eagerly, loading
++the owning module's private part on demand if necessary. Identity when `lazyId = 0`.
++-/
++@[implemented_by lazyPartsResolveConstImpl]
++def lazyPartsResolveConst (lazyId : Nat) (const2ModIdx : Std.HashMap Name ModuleIdx) (n : Name)
++    (c? : Option ConstantInfo) : Option ConstantInfo :=
++  let _ := (lazyId, const2ModIdx, n)
++  c?
++
+ namespace Kernel
+ 
+ structure Diagnostics where
+@@ -279,10 +971,16 @@ deriving Nonempty
+ 
+ namespace Environment
+ 
++/-- Lookup among the imported constants (`map₁`), resolving lazily loaded private parts. -/
++@[inline] def baseFind? (env : Environment) (n : Name) : Option ConstantInfo :=
++  let c? := env.constants.map₁[n]?
++  if env.header.lazyPartsId == 0 then c? else lazyPartsResolveConst env.header.lazyPartsId env.const2ModIdx n c?
++
+ @[export lean_environment_find]
+ def find? (env : Environment) (n : Name) : Option ConstantInfo :=
+   /- It is safe to use `find'` because we never overwrite imported declarations. -/
+-  env.constants.find?' n
++  let c? := env.constants.find?' n
++  if env.header.lazyPartsId == 0 then c? else lazyPartsResolveConst env.header.lazyPartsId env.const2ModIdx n c?
+ 
+ @[export lean_environment_mark_quot_init]
+ private def markQuotInit (env : Environment) : Environment :=
+@@ -814,14 +1512,14 @@ Use `findTask` instead if any blocking should be avoided.
+ -/
+ def findAsync? (env : Environment) (n : Name) (skipRealize := false) : Option AsyncConstantInfo := do
+   -- Avoid going through `AsyncConstantInfo` for `base` access
+-  if let some c := env.base.get env |>.constants.map₁[n]? then
++  if let some c := (env.base.get env).baseFind? n then
+     return .ofConstantInfo c
+   findAsyncCore? (skipRealize := skipRealize) env n
+ 
+ /-- Like `findAsync?` but returns a task instead of resorting to blocking. -/
+ def findTask (env : Environment) (n : Name) (skipRealize := false) : Task (Option AsyncConstantInfo) := Id.run do
+   -- Avoid going through `AsyncConstantInfo` for `base` access
+-  if let some c := env.base.get env |>.constants.map₁[n]? then
++  if let some c := (env.base.get env).baseFind? n then
+     return .pure <| some <| .ofConstantInfo c
+   findTaskCore (skipRealize := skipRealize) env n
+ 
+@@ -831,13 +1529,30 @@ through the result.
+ -/
+ def findConstVal? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantVal := do
+   -- Avoid going through `AsyncConstantInfo` for `base` access
+-  if let some c := env.base.get env |>.constants.map₁[n]? then
++  -- Lazy parts: a weakened exported `ConstantInfo` has the same `ConstantVal` as the private one, so the
++  -- private part need not be loaded for this lookup
++  if let some c := (env.base.get env).constants.map₁[n]? then
+     return c.toConstantVal
++  if (env.base.get env).header.lazyPartsId != 0 then
++    if let some c := (env.base.get env).baseFind? n then
++      return c.toConstantVal
+   env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantVal)
+ 
++/--
++The kind of `n` as visible without loading lazily deferred parts. Under lazy parts a theorem or
++definition weakened to an axiom in the exported view reports `.axiom`; every other kind is exact,
++so callers that only test for kinds that are never weakened (inductive, constructor, recursor,
++quotient) get the same answer as `findAsync?`. Identical to `(findAsync? n).map (·.kind)` when
++nothing is lazily loaded.
++-/
++def findKindNoLoad? (env : Environment) (n : Name) : Option ConstantKind := do
++  if let some c := (env.base.get env).constants.map₁[n]? then
++    return .ofConstantInfo c
++  env.findAsyncCore? n |>.map (·.kind)
++
+ /-- Like `findAsync?`, but blocks until the constant's info is fully available.  -/
+ def find? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantInfo := do
+-  if let some c := env.base.get env |>.constants.map₁[n]? then
++  if let some c := (env.base.get env).baseFind? n then
+     return c
+   env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantInfo)
+ 
+@@ -1150,7 +1865,8 @@ Checks whether the given declaration is known on the current branch, in which ca
+ not block.
+ -/
+ def containsOnBranch (env : Environment) (n : Name) : Bool :=
+-  (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
++  (env.asyncConsts.find? n |>.isSome) || ((env.base.get env).baseFind? n).isSome ||
++    (env.base.get env).constants.map₂.contains n
+ 
+ /--
+ Returns the constants added in the current module, in elaboration tree pre-order: the top-level
+@@ -1673,14 +2389,18 @@ def getModuleEntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtens
+   let exts := match level with
+     | .exported => env.base.private.extensions
+     | _         => env.serverBaseExts
++  match (if env.header.lazyPartsId != 0 then lazyPartsModuleEntries env.header.lazyPartsId ext.name m false else none) with
++  | some es => unsafe unsafeCast es
+   -- safety: as in `getStateUnsafe`
+-  unsafe (ext.toEnvExtension.getStateImpl exts).importedEntries[m]!
++  | none => unsafe (ext.toEnvExtension.getStateImpl exts).importedEntries[m]!
+ 
+ /-- Retrieves additional IR extension state for the interpreter. -/
+ def getModuleIREntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ)
+     (env : Environment) (m : ModuleIdx) : Array α :=
++  match (if env.header.lazyPartsId != 0 then lazyPartsModuleEntries env.header.lazyPartsId ext.name m true else none) with
++  | some es => unsafe unsafeCast es
+   -- safety: as in `getStateUnsafe`
+-  unsafe (ext.toEnvExtension.getStateImpl env.base.private.irBaseExts).importedEntries[m]!
++  | none => unsafe (ext.toEnvExtension.getStateImpl env.base.private.irBaseExts).importedEntries[m]!
+ 
+ def addEntry {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (b : β)
+     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
+@@ -1763,6 +2483,16 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
+ @[implemented_by registerPersistentEnvExtensionUnsafe]
+ opaque registerPersistentEnvExtension {α β σ : Type} [Inhabited σ] (descr : PersistentEnvExtensionDescr α β σ) : IO (PersistentEnvExtension α β σ)
+ 
++/--
++`CompactedRegion.save` specialised to `ModuleData` roots (v2 format, no dep regions, no closures):
++the compactor is told to emit the `constNames` and the `ConstantInfo` shells at the front of the
++file so that importing does not touch the expression trees (shell-first olean layout). Same file format
++and object graph as `CompactedRegion.save`.
++-/
++@[extern "lean_save_module_data_part"]
++private unsafe opaque saveModuleDataPart (fname : @& System.FilePath) (key : @& Name)
++    (data : @& ModuleData) (prev : Option Compactor) : IO Compactor
++
+ /--
+ Stores each given module data in the respective file name. Objects shared with prior parts are not
+ duplicated. Thus the data cannot be loaded with individual `readModuleData` calls but must loaded by
+@@ -1773,7 +2503,7 @@ def saveModuleDataParts (mod : Name) (parts : Array (System.FilePath × ModuleDa
+   let mut cs : Option Compactor := none
+   for h : i in [:parts.size] do
+     let (fname, data) := parts[i]
+-    cs := some (← unsafe CompactedRegion.save fname mod data #[] cs)
++    cs := some (← unsafe saveModuleDataPart fname mod data cs)
+ 
+ /--
+ Loads the module data from the given file names. The files must be (a prefix of) the result of a
+@@ -1790,7 +2520,7 @@ def readModuleDataParts (fnames : Array System.FilePath) :
+   return result
+ 
+ def saveModuleData (fname : System.FilePath) (mod : Name) (data : ModuleData) : IO Unit := do
+-  let _ ← unsafe CompactedRegion.save fname mod data #[] none
++  let _ ← unsafe saveModuleDataPart fname mod data none
+ 
+ def readModuleData (fname : @& System.FilePath) : IO (ModuleData × CompactedRegion) :=
+   unsafe CompactedRegion.read fname #[]
+@@ -1972,7 +2702,9 @@ private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
+   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
+   return env.modifyCheckedAsync ({ · with extensions := exts })
+ 
+-private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) : IO Environment := do
++private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData)
++    (opts : Options) (image : Std.HashMap Name EnvExtensionState) :
++    IO Environment := do
+   loop 0 env
+ where
+   loop (i : Nat) (env : Environment) : IO Environment := do
+@@ -1985,8 +2717,13 @@ where
+       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
+       let prevSize := (← persistentEnvExtensionsRef.get).size
+       let prevAttrSize ← getNumBuiltinAttributes
+-      let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+-      let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
++      let mut env := env
++      -- Tactic index: install this extension's state from the image instead of rebuilding it?
++      if let some st := image[extDescr.name]? then
++        env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := st }
++      else
++        let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
++        env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
+       if extDescr.name == `Lean.regularInitAttr then
+         -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
+         -- `getModule(IR)Entries` but we should also do it before attempting to run user-defined
+@@ -2011,6 +2748,28 @@ private structure ImportedModule extends EffectiveImport where
+   irParts   : Array (ModuleData × CompactedRegion)
+   /-- If true, IR is loaded transitively. -/
+   needsIRTrans : Bool
++  /--
++  Lazy parts: file names of the not-yet-loaded `.olean.server`/`.olean.private` parts (to be chained on the
++  regions of `parts`). `importModulesCore` only reads the `.olean` part; `finalizeImport` loads the
++  remaining parts if they are needed, or leaves them to be loaded on demand.
++  -/
++  deferredParts : Array System.FilePath := #[]
++  /-- Lazy parts: file names of the not-yet-loaded `.ir.sig`/`.ir` parts (empty if IR is not needed). -/
++  irFiles   : Array System.FilePath := #[]
++
++/--
++Tactic index: the directory an image is read from and written to when `LEAN_TACTIC_INDEX_DIR` is unset — the
++one holding the `.olean` of the topmost module of the closure, i.e. the `lib/lean` directory of the
++library that owns it (`.lake/build/lib/lean` for a Lake package). An image is valid for exactly one
++(toolchain, library revision), which is what an olean cache is keyed on too, so it belongs beside
++the oleans and travels with them. Both the reader and the writer compute it from the same closure,
++so they agree without being told.
++-/
++private def tacticIndexImageDirOf (modules : Array ImportedModule) : Option System.FilePath := Id.run do
++  for m in modules.reverse do
++    if let some (_, r) := m.parts[0]? then
++      return r.filePath.parent
++  return none
+ 
+ /-- The main module data that will eventually be used to construct the publicly accessible constants. -/
+ private def ImportedModule.publicModule? (self : ImportedModule) : Option ModuleData := do
+@@ -2023,7 +2782,9 @@ private def ImportedModule.publicModule? (self : ImportedModule) : Option Module
+ private def ImportedModule.getData? (self : ImportedModule) (level : OLeanLevel) : Option ModuleData := do
+   -- Without the module system, we only have the exported level.
+   let level := if (← self.publicModule?).isModule then level else .exported
+-  self.parts[level.ctorIdx]?.map (·.1)
++  -- Lazy parts: parts may not have been loaded (yet); fall back to the highest loaded one. All parts share
++  -- `imports`/`isModule`, and `finalizeImport` requests the private level only after loading it.
++  (self.parts[level.ctorIdx]? <|> self.parts.back?).map (·.1)
+ 
+ /-- The main module data that will eventually be used to construct the kernel environment. -/
+ private def ImportedModule.mainModule? (self : ImportedModule) : Option ModuleData :=
+@@ -2208,42 +2969,64 @@ where
+         let needsIRTrans := needsIRTrans || mod.needsIRTrans
+         let needsIR := needsIRTrans || importAll || (loadIRSig && needsData)
+         let irPhases := if irPhases == mod.irPhases then irPhases else .all
+-        let parts ← if needsData && mod.parts.isEmpty then loadData i else pure mod.parts
+-        let irParts ← if needsIR && mod.irParts.isEmpty then loadIR i else pure mod.irParts
++        let (parts, deferredParts) ← if needsData && mod.parts.isEmpty then loadData i else pure (mod.parts, mod.deferredParts)
++        let (irParts, irFiles) ← if needsIR && mod.irParts.isEmpty && mod.irFiles.isEmpty then
++            -- Lazy parts: a module without data is reached only through its `.ir`, whose `imports` drive the
++            -- DAG walk, so it is loaded eagerly as before
++            if needsData then pure (#[], ← loadIRPaths i) else pure (← loadIR i, #[])
++          else pure (mod.irParts, mod.irFiles)
+         if importAll != mod.importAll || isExported != mod.isExported ||
+             needsIRTrans != mod.needsIRTrans || needsData != mod.hasData || irPhases != mod.irPhases then
+           modify fun s => { s with moduleNameMap := s.moduleNameMap.insert i.module { mod with
+-            importAll, isExported, irPhases, parts, irParts, hasData := needsData, needsIRTrans }}
++            importAll, isExported, irPhases, parts, deferredParts, irParts, irFiles, hasData := needsData, needsIRTrans }}
+           -- bump entire closure
+           goRec mod
+         continue
+ 
+       -- newly discovered module
+-      let parts ← if needsData then loadData i else pure #[]
+-      let irParts ← if needsIR then loadIR i else pure #[]
+-      let mod := { i with importAll, isExported, irPhases, parts, irParts, needsIRTrans, hasData := needsData }
++      let (parts, deferredParts) ← if needsData then loadData i else pure (#[], #[])
++      let (irParts, irFiles) ← if needsIR then
++          if needsData then pure (#[], ← loadIRPaths i) else pure (← loadIR i, #[])
++        else pure (#[], #[])
++      let mod := { i with importAll, isExported, irPhases, parts, deferredParts, irParts, irFiles, needsIRTrans, hasData := needsData }
+       goRec mod
+       modify fun s => { s with
+         moduleNameMap := s.moduleNameMap.insert i.module mod
+         moduleNames := s.moduleNames.push i.module
+       }
+-  -- .olean + .olean.server (optional) + .olean.private (optional)
+-  loadData i := do
++  -- Lazy parts: `.olean` is read now; `.olean.server`/`.olean.private` (chained on it) are only recorded
++  -- and loaded by `finalizeImport` if needed (import levels are final only after the DAG walk).
++  loadData i : ImportStateM (Array (ModuleData × CompactedRegion) × Array System.FilePath) := do
+     if let some arts := arts.find? i.module then
+-      -- Opportunistically load all available parts.
+       -- Producer (e.g., Lake) should limit parts to the proper import level.
+       let fnames := arts.oleanParts (inServer := globalLevel ≥ .server)
+-      readModuleDataParts fnames
++      let some mFile := fnames[0]? | return (#[], #[])
++      let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
++      return (#[main], fnames[1...*].toArray)
+     else
+-      readModuleDataPartsOfMod i.module
+-  -- .ir.sig + .ir (optional)
++      let mFile ← findOLean i.module
++      unless (← mFile.pathExists) do
++        throw <| IO.userError s!"object file '{mFile}' of module {i.module} does not exist"
++      let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
++      if !main.1.isModule then
++        return (#[main], #[])
++      return (#[main], #[OLeanLevel.server.adjustFileName mFile, OLeanLevel.private.adjustFileName mFile])
++  -- .ir.sig + .ir (optional), eager (modules without data)
+   loadIR i := do
+     if let some arts := arts.find? i.module then
+-      -- Opportunistically load all available parts.
+-      -- Producer (e.g., Lake) should limit parts to the proper import level.
+       readModuleDataParts arts.irParts
+     else
+       readIRPartsOfMod i.module
++  -- Lazy parts: `.ir.sig` + `.ir` file names (optional); loaded by `finalizeImport` or on demand
++  loadIRPaths i : ImportStateM (Array System.FilePath) := do
++    if let some arts := arts.find? i.module then
++      return arts.irParts
++    else
++      let mFile ← findOLean i.module
++      let irSigFile := mFile.withExtension "ir.sig"
++      unless (← irSigFile.pathExists) do
++        return #[]
++      return #[irSigFile, mFile.withExtension "ir"]
+ 
+ /--
+ Returns `true` if `cinfo₁` and `cinfo₂` represent the same theorem/axiom, with `cinfo₁` potentially
+@@ -2299,6 +3082,69 @@ where
+       p := body
+     p.isProp
+ 
++
++
++/-- Bump when the index contents change (e.g. `lazyPartsLazyExtNames`). -/
++private def lazyPartsIndexVersion : UInt64 := 3
++
++/-- Hash of the module closure and of the deferred files' sizes/mtimes: the index cache key. -/
++private def lazyPartsKey (mods : Array ImportedModule) : IO UInt64 := do
++  let mut h : UInt64 := mixHash 7 lazyPartsIndexVersion
++  for mod in mods do
++    h := mixHash h mod.module.hash
++    for f in (mod.deferredParts.back?.toArray ++ mod.irFiles.back?.toArray) do
++      let md ← f.metadata
++      h := mixHash (mixHash h md.byteSize) (mixHash md.modified.sec.toNat.toUInt64 md.modified.nsec.toUInt64)
++  return h
++
++private unsafe def lazyPartsLoadIndex (path : System.FilePath) : IO (Option (LazyPartsIndex × CompactedRegion)) := do
++  unless ← path.pathExists do return none
++  try
++    let (idx, r) ← CompactedRegion.read (α := LazyPartsIndex) path #[]
++    return some (idx, r)
++  catch _ => return none
++
++private unsafe def lazyPartsSaveIndex (path : System.FilePath) (idx : LazyPartsIndex) : IO Unit := do
++  if let some dir := path.parent then IO.FS.createDirAll dir
++  let tmp := path.addExtension s!"tmp{← IO.Process.getPID}"
++  let _ ← CompactedRegion.save tmp `_lazyPartsIndex idx #[] none
++  IO.FS.rename tmp path
++
++/-- Builds the index from fully (eagerly) loaded modules. -/
++private unsafe def lazyPartsBuildIndex (mods : Array ImportedModule) : LazyPartsIndex := Id.run do
++  let mut out := #[]
++  for mod in mods do
++    let ir := mod.irParts.back?.map (·.1)
++    let extraConstNames := (ir.map (·.extraConstNames)).getD #[]
++    let irEntries := ((ir.map (·.entries)).getD #[]).filter (·.1 != lazyPartsDeclMapExtName)
++    let mut privOnlyNames := #[]
++    let mut privOrder := #[]
++    let mut privEagerEntries := #[]
++    if mod.parts.size > 1 then
++      if let (some exp, some priv) := (mod.publicModule?, mod.mainModule?) then
++        let names : Std.HashMap Name Unit := exp.constNames.foldl (·.insert · ())
++          (Std.HashMap.emptyWithCapacity exp.constNames.size)
++        privOnlyNames := priv.constNames.filter (!names.contains ·)
++        let mut pos : Std.HashMap Name Nat := Std.HashMap.emptyWithCapacity exp.constNames.size
++        for h : i in *...exp.constNames.size do
++          pos := pos.insert exp.constNames[i] i
++        privOrder := priv.constNames.filterMap (pos[·]?)
++        let expEnt := lazyPartsEntriesMap exp
++        for (en, es) in priv.entries do
++          if lazyPartsLazyExtNames.contains en then continue
++          let ees := expEnt.getD en #[]
++          let mut same := es.size == ees.size
++          if same then
++            for i in 0...es.size do
++              if let (some a, some b) := (es[i]?, ees[i]?) then
++                if ptrAddrUnsafe a != ptrAddrUnsafe b then
++                  same := false
++                  break
++          unless same do
++            privEagerEntries := privEagerEntries.push (en, es)
++    out := out.push { extraConstNames, irEntries, privOnlyNames, privOrder, privEagerEntries }
++  return { moduleNames := mods.map (·.module), mods := out }
++
+ /--
+ Constructs environment from `importModulesCore` results.
+ 
+@@ -2310,15 +3156,87 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+     (loadIRSig := false) :
+     IO Environment := do
+   let modules := s.moduleNames.filterMap (s.moduleNameMap[·]?)
+-  let moduleData ← modules.mapM fun mod => do
++  -- Lazy parts: decide what to load now and what on demand (legacy roots only).
++  let lazyPartsMode ← if level == .private && !isModule then lazyPartsMode else pure 0
++  let lazyPartsVerbose := (← IO.getEnv "LEAN_LAZY_PARTS_VERBOSE").isSome
++  let mut lazyPartsIndex : Option LazyPartsIndex := none
++  let mut lazyPartsIndexRegion : Option CompactedRegion := none
++  let mut lazyPartsPath : Option System.FilePath := none
++  let lazyPartsBound : CacheBound ←
++    if lazyPartsMode > 0 then cacheReadBound "LEAN_LAZY_PARTS" cacheDefaultMinFree cacheDefaultMaxSize
++    else pure {}
++  if lazyPartsMode > 0 then
++    let key ← lazyPartsKey modules
++    if let some dir ← lazyPartsIndexDir then
++      let p := dir / s!"index-{key}.lazyparts"
++      lazyPartsPath := some p
++      if let some (idx, r) ← unsafe lazyPartsLoadIndex p then
++        if idx.moduleNames == modules.map (·.module) then
++          lazyPartsIndex := some idx
++          lazyPartsIndexRegion := some r
++          cacheTouch p
++          cacheStats "lazy-parts hit"
++    if lazyPartsVerbose then
++      IO.eprintln s!"lazy-parts: mode {lazyPartsMode}, index {lazyPartsPath} ({if lazyPartsIndex.isSome then "hit" else "miss"})"
++  let lazyIR := lazyPartsMode ≥ 1 && lazyPartsIndex.isSome
++  let lazyPrivate := lazyPartsMode ≥ 2 && lazyPartsIndex.isSome
++  -- Lazy parts: load the deferred parts that are needed eagerly
++  let modules ← modules.mapM fun mod => do
++    let mut mod := mod
++    if !mod.deferredParts.isEmpty then
++      if mod.importAll && !lazyPrivate then
++        let more ← lazyPartsReadPartsWithDeps mod.deferredParts (mod.parts.map (·.2))
++        mod := { mod with parts := mod.parts ++ more, deferredParts := #[] }
++      else if !mod.importAll && level ≥ .server then
++        -- `.olean.server` only; `.olean.private` is not needed without `import all`
++        let more ← lazyPartsReadPartsWithDeps (mod.deferredParts.extract 0 1) (mod.parts.map (·.2))
++        mod := { mod with parts := mod.parts ++ more, deferredParts := #[] }
++      else if !mod.importAll then
++        mod := { mod with deferredParts := #[] }
++    if !mod.irFiles.isEmpty && !lazyIR then
++      let irParts ← readModuleDataParts mod.irFiles
++      mod := { mod with irParts, irFiles := #[] }
++    return mod
++  let moduleData ← modules.mapIdxM fun modIdx mod => do
++    if lazyPrivate && !mod.deferredParts.isEmpty then
++      -- exported data, with the private-level entries of eager extensions substituted from the index
++      let some data := mod.publicModule? |
++        throw <| IO.userError s!"missing data file for module {mod.module}"
++      let idx := lazyPartsIndex.get!.mods[modIdx]!
++      let entries := data.entries.map fun (en, es) =>
++        match idx.privEagerEntries.find? (·.1 == en) with
++        | some (_, es') => (en, es')
++        | none => (en, es)
++      let entries := entries ++ idx.privEagerEntries.filter fun (en, _) => data.entries.all (·.1 != en)
++      -- constants in private (declaration) order, read without touching the `ConstantInfo` pages
++      let mut constNames := Array.emptyWithCapacity idx.privOrder.size
++      let mut constants := Array.emptyWithCapacity idx.privOrder.size
++      for i in idx.privOrder do
++        if h : i < data.constants.size then
++          constNames := constNames.push data.constNames[i]!
++          constants := constants.push (getPersistentElem data.constants i h)
++      return { data with entries, constNames, constants }
+     let some data := mod.mainModule? |
+       throw <| IO.userError s!"missing data file for module {mod.module}"
+     return data
+-  let irData ← modules.mapM fun mod => do
++  let irData ← modules.mapIdxM fun modIdx mod => do
++    if lazyIR && !mod.irFiles.isEmpty then
++      -- `.ir` deferred: the eagerly needed parts of it come from the index
++      let idx := lazyPartsIndex.get!.mods[modIdx]!
++      let data : ModuleData := {
++        isModule := true
++        imports := #[]
++        constNames := #[]
++        constants := #[]
++        extraConstNames := idx.extraConstNames
++        entries := idx.irEntries }
++      return data
+     let some data := mod.irData? loadIRSig |
+       throw <| IO.userError s!"missing IR data file for module {mod.module}"
+     return data
+-  let numPrivateConsts := moduleData.foldl (init := 0) fun numPrivateConsts data =>
++  let numPrivOnlyConsts := if lazyPrivate then
++    lazyPartsIndex.get!.mods.foldl (init := 0) fun n idx => n + idx.privOnlyNames.size else 0
++  let numPrivateConsts := numPrivOnlyConsts + moduleData.foldl (init := 0) fun numPrivateConsts data =>
+     numPrivateConsts + data.constants.size
+   let numExtraConsts := irData.foldl (init := 0) fun numExtraConsts data =>
+     numExtraConsts + data.extraConstNames.size
+@@ -2331,12 +3249,22 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+   let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts)
+   for h : modIdx in *...moduleData.size do
+     let data := moduleData[modIdx]
+-    for cname in data.constNames, cinfo in data.constants do
+-      match privateConstantMap.getThenInsertIfNew? cname cinfo with
+-      | (cinfoPrev?, constantMap') =>
+-        privateConstantMap := constantMap'
+-        if let some cinfoPrev := cinfoPrev? then
+-          -- Recall that the map has not been modified when `cinfoPrev? = some _`.
++    -- Iterates `constNames` and `constants` in lockstep (like `for cname in constNames, cinfo in
++    -- constants`), but reads `cinfo` with `getPersistentElem` and hands it straight to the map so
++    -- that the `ConstantInfo` object is never dereferenced (see `getPersistentElem`). The result
++    -- is the same as `getThenInsertIfNew?` followed by the duplicate check: `insertIfNew` leaves
++    -- the map unchanged exactly when the name is present, which we detect via `size`.
++    for h : i in *...(min data.constNames.size data.constants.size) do
++      have hn : i < data.constNames.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_left ..)
++      have hc : i < data.constants.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_right ..)
++      let cname := data.constNames[i]
++      let numConsts := privateConstantMap.size
++      privateConstantMap := privateConstantMap.insertIfNew cname (getPersistentElem data.constants i hc)
++      if privateConstantMap.size == numConsts then
++        -- `cname` was already present and the map has not been modified. This is rare (~1k of
++        -- 772k constants for `import Mathlib`), so reading `cinfo` normally here is fine.
++        let cinfo := data.constants[i]
++        if let some cinfoPrev := privateConstantMap[cname]? then
+           if subsumesInfo privateConstantMap cinfo cinfoPrev then
+             privateConstantMap := privateConstantMap.insert cname cinfo
+           else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
+@@ -2345,15 +3273,39 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+     if let some data := irData[modIdx]? then
+       for cname in data.extraConstNames do
+         const2ModIdx := const2ModIdx.insertIfNew cname modIdx
++    if lazyPrivate then
++      -- names that only exist in the (deferred) `.olean.private` part
++      for cname in lazyPartsIndex.get!.mods[modIdx]!.privOnlyNames do
++        const2ModIdx := const2ModIdx.insertIfNew cname modIdx
++
++  -- Lazy parts: register the lazy-loading state
++  let mut lazyId := 0
++  if lazyIR || lazyPrivate then
++    let st : LazyPartsState := {
++      lazyPrivate, verbose := lazyPartsVerbose
++      moduleNames := modules.map (·.module)
++      mods := modules.map fun mod =>
++        { privFiles := mod.deferredParts, privDeps := mod.parts.map (·.2), irFiles := mod.irFiles }
++      exported := privateConstantMap
++      privEntries := .replicate modules.size none
++      irEntries := .replicate modules.size none
++      regions := lazyPartsIndexRegion.toArray
++    }
++    let ref ← IO.mkRef st
++    lazyId ← lazyPartsRegistry.modifyGet fun r => (r.size + 1, r.push ref)
+ 
+   if isModule then
+     for mod in modules.filter (·.isExported) do
+       let some data := mod.publicModule? | continue
+-      for cname in data.constNames, cinfo in data.constants do
+-        match publicConstantMap.getThenInsertIfNew? cname cinfo with
+-        | (cinfoPrev?, constantMap') =>
+-          publicConstantMap := constantMap'
+-          if let some cinfoPrev := cinfoPrev? then
++      for h : i in *...(min data.constNames.size data.constants.size) do
++        have hn : i < data.constNames.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_left ..)
++        have hc : i < data.constants.size := Nat.lt_of_lt_of_le (Std.Rio.lt_upper_of_mem h) (Nat.min_le_right ..)
++        let cname := data.constNames[i]
++        let numConsts := publicConstantMap.size
++        publicConstantMap := publicConstantMap.insertIfNew cname (getPersistentElem data.constants i hc)
++        if publicConstantMap.size == numConsts then
++          let cinfo := data.constants[i]
++          if let some cinfoPrev := publicConstantMap[cname]? then
+             if subsumesInfo publicConstantMap cinfo cinfoPrev then
+               publicConstantMap := publicConstantMap.insert cname cinfo
+             -- no need to check for duplicates again, `privateConstMap` should be a superset
+@@ -2369,6 +3321,13 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+       trustLevel, imports, moduleData, isModule
+       modules      := modules.map (·.toEffectiveImport)
+       regions      := modules.flatMap (·.parts.map (·.2)) ++ modules.flatMap (·.irParts.map (·.2))
++      moduleName2Idx := Id.run do
++        let mut m : Std.HashMap Name ModuleIdx := {}
++        for h : idx in [0:modules.size] do
++          m := m.insert modules[idx].module idx
++        if lazyId != 0 then
++          m := m.insert lazyPartsIdKey (lazyId : Nat)
++        return m
+     }
+   }
+   let publicConstants : ConstMap := SMap.fromHashMap publicConstantMap false
+@@ -2401,7 +3360,88 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+        Safety: There are no concurrent accesses to `env` at this point. -/
+     env ← unsafe Runtime.markPersistent env
+   if loadExts then
+-    env ← finalizePersistentExtensions env moduleData opts
++    -- Tactic index: map the shipped image of the eager extension indexes for this closure, if there is one
++    let tacticIndexEnv ← IO.getEnv "LEAN_TACTIC_INDEX"
++    let tacticIndexOff := tacticIndexEnv == some "0" || tacticIndexEnv == some "off"
++    let tacticIndexVerbose := (← IO.getEnv "LEAN_TACTIC_INDEX_VERBOSE").isSome
++    let tacticIndexWriteEnv ← IO.getEnv "LEAN_TACTIC_INDEX_WRITE"
++    let tacticIndexWrite := tacticIndexWriteEnv.isSome && tacticIndexWriteEnv != some "" && tacticIndexWriteEnv != some "0"
++    let tacticIndexDirEnv := (← IO.getEnv "LEAN_TACTIC_INDEX_DIR").map System.FilePath.mk
++    let mut tacticIndexImage : Std.HashMap Name EnvExtensionState := {}
++    let mut tacticIndexPath : Option System.FilePath := none
++    let mut tacticIndexKeyVal : UInt64 := 0
++    let mut tacticIndexMapped := false
++    -- dependency regions for *writing*: only those that landed at their saved address
++    let tacticIndexDeps := env.header.regions.filter (·.isMemoryMapped)
++    let tacticIndexModuleNames := env.header.modules.map (·.module)
++    unless tacticIndexOff do
++      if let some dir := tacticIndexDirEnv <|> tacticIndexImageDirOf modules then
++        -- The key is computed *here*, before `runInitAttrs` registers the user extensions, so that
++        -- the writing and the reading process see the same extension list.
++        let pExts ← persistentEnvExtensionsRef.get
++        let counts := pExts.map fun d =>
++          (d.name, (d.toEnvExtension.getState (asyncMode := .sync) env).importedEntries.foldl
++            (fun a e => a + e.size) 0)
++        tacticIndexKeyVal := tacticIndexKey tacticIndexModuleNames env.header.regions counts
++        let p := dir / s!"exts-{tacticIndexKeyVal}.tacticindex"
++        tacticIndexPath := some p
++        -- Reading is the only thing an ordinary run does: no directory is created, no file is
++        -- stamped, nothing is evicted. A missing, stale or unreadable image simply is not used.
++        if let some imgDeps ← tacticIndexReadDeps p env.header.regions then
++          if let some (c, r) ← unsafe tacticIndexLoadImage p imgDeps tacticIndexVerbose then
++            if tacticIndexVerbose && c.key != tacticIndexKeyVal then
++              IO.eprintln s!"tactic-index: image key {c.key} is not this closure's key {tacticIndexKeyVal}; ignored"
++            if c.key == tacticIndexKeyVal && c.moduleNames == tacticIndexModuleNames &&
++                c.extNames.size == c.states.size then
++              tacticIndexRegions.modify (·.push r)
++              tacticIndexMapped := r.isMemoryMapped
++              for h : i in *...c.extNames.size do
++                tacticIndexImage := tacticIndexImage.insert c.extNames[i] c.states[i]!
++        -- `LEAN_CACHE_STATS` accounting: one line per import, which is how a distributor finds out
++        -- which closures its users actually present (and how a build is shown to write nothing).
++        cacheStats (if tacticIndexImage.isEmpty then s!"tactic-index miss {tacticIndexKeyVal}" else s!"tactic-index hit {tacticIndexKeyVal}")
++        if tacticIndexVerbose then
++          IO.eprintln s!"tactic-index: image {p} ({if tacticIndexImage.isEmpty then "absent" else s!"used, {tacticIndexImage.size} extensions, mmap={tacticIndexMapped}"})"
++    env ← finalizePersistentExtensions env moduleData opts tacticIndexImage
++    -- Tactic index: build and write the image, when and only when asked to (`LEAN_TACTIC_INDEX_WRITE`). This is the
++    -- distributor's path -- a library's CI, or a user doing it once for the header they work under
++    -- -- and is never taken by an ordinary run.
++    if !tacticIndexOff && tacticIndexWrite && tacticIndexImage.isEmpty then
++      if let some p := tacticIndexPath then
++        try
++          let pExts ← persistentEnvExtensionsRef.get
++          let mut extNames := #[]
++          let mut states := #[]
++          -- Probe phase: an extension can be imaged iff the object compactor accepts its state.
++          -- Probing (rather than naming the extensions) is what lets the tactic index cover user extensions
++          -- — Mathlib's `to_additive` table, its Aesop rule sets, its `@[simp]`-like attribute
++          -- sets — without knowing them, and it is what guarantees the combined save below
++          -- cannot fail.
++          let probe := p.addExtension s!"probe{← IO.Process.getPID}"
++          for d in pExts do
++            if tacticIndexNeverDefer.contains d.name then continue
++            let st := d.toEnvExtension.getState (asyncMode := .sync) env
++            unless st.importedEntries.any (!·.isEmpty) do continue
++            let ok ← try
++                let _ ← unsafe CompactedRegion.save probe `_tacticIndexProbe st.state tacticIndexDeps none
++                let sz := (← probe.metadata).byteSize
++                pure (decide (sz ≥ tacticIndexMinStateBytes))
++              catch _ => pure false
++            try IO.FS.removeFile probe catch _ => pure ()
++            if ok then
++              extNames := extNames.push d.name
++              states := states.push st.state
++            else if tacticIndexVerbose then
++              IO.eprintln s!"tactic-index: skip {d.name} (not compactable or below {tacticIndexMinStateBytes} B)"
++          if ← unsafe tacticIndexSaveImage p tacticIndexDeps env.header.regions
++              { key := tacticIndexKeyVal, moduleNames := tacticIndexModuleNames, extNames, states } tacticIndexVerbose then
++            cacheStats s!"tactic-index write {(← p.metadata).byteSize} {(← (tacticIndexDepsPath p).metadata).byteSize}"
++            if tacticIndexVerbose then
++              IO.eprintln s!"tactic-index: wrote image {p} ({extNames.size} extensions, {(← p.metadata).byteSize} B)"
++          else
++            IO.eprintln s!"tactic-index: could not write a readable image to {p}"
++        catch e =>
++          IO.eprintln s!"tactic-index: could not write image {p}: {e}"
+     if leakEnv then
+       /- Ensure the final environment including environment extension states is
+         marked persistent as documented.
+@@ -2409,6 +3449,36 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
+         Safety: There are no concurrent accesses to `env` at this point, assuming
+         extensions' `addImportFn`s did not spawn any unbound tasks. -/
+       env ← unsafe Runtime.markPersistent env
++  -- Lazy parts: on the first (eager) import of this closure, write the index for subsequent imports
++  if lazyPartsMode > 0 && lazyPartsIndex.isNone then
++    if let some p := lazyPartsPath then
++      try
++        -- Three bounds (`LEAN_LAZY_PARTS_MIN_USES`/`_MIN_FREE`/`_MAX_SIZE`). An index is
++        -- ~112 MB, so the same 5 GB cap holds ~45 of them.
++        let dir := p.parent.getD "."
++        let room ← cacheFloorOk dir lazyPartsBound
++        -- `fileStem`, not `fileName`: a marker named `seen-index-<key>.lazyparts` would be caught by
++        -- every `*.lazyparts` glob anyone writes over this directory.
++        let admitted ← if room then cacheAdmit dir "seen-" (p.fileStem.getD "") lazyPartsBound
++                       else pure false
++        if !room then
++          cacheStats "lazy-parts skip-floor"
++          if lazyPartsVerbose then
++            IO.eprintln s!"lazy-parts: not writing index {p} (free space below {lazyPartsBound.minFree} B)"
++        else if !admitted then
++          cacheStats "lazy-parts skip-uses"
++          if lazyPartsVerbose then
++            IO.eprintln s!"lazy-parts: not writing index {p} (seen fewer than {lazyPartsBound.minUses} times)"
++        else
++          unsafe lazyPartsSaveIndex p (unsafe lazyPartsBuildIndex modules)
++          cacheStats s!"lazy-parts write {(← p.metadata).byteSize}"
++          if lazyPartsVerbose then IO.eprintln s!"lazy-parts: wrote index {p}"
++          let (evicted, freed, total) ← cacheEnforceCap dir lazyPartsBound
++          if evicted > 0 then cacheStats s!"lazy-parts evict {evicted} {freed} {total}"
++          if lazyPartsVerbose && (evicted > 0 || lazyPartsBound.maxSize != 0) then
++            IO.eprintln s!"lazy-parts: index dir {total} B, evicted {evicted} ({freed} B), cap {lazyPartsBound.maxSize} B"
++      catch e =>
++        if lazyPartsVerbose then IO.eprintln s!"lazy-parts: could not write index {p}: {e}"
+   return { env with importRealizationCtx? := some {
+     -- safety: `RealizationContext` is private
+     env := unsafe unsafeCast env
+@@ -2504,6 +3574,13 @@ def displayStats (env : Environment) : IO Unit := do
+   IO.println ("number of buckets for imported consts: " ++ toString env.constants.numBuckets);
+   IO.println ("trust level:                           " ++ toString env.header.trustLevel);
+   IO.println ("number of extensions:                  " ++ toString env.base.private.extensions.size);
++  if env.header.lazyPartsId != 0 then
++    if let some ref := (← lazyPartsRegistry.get)[env.header.lazyPartsId - 1]? then
++      let s ← ref.get
++      IO.println ("lazy private parts loaded:             " ++ toString s.numPrivLoads ++ " of " ++ toString (s.mods.filter (!·.privFiles.isEmpty)).size);
++      IO.println ("lazy IR parts loaded:                  " ++ toString s.numIRLoads ++ " of " ++ toString (s.mods.filter (!·.irFiles.isEmpty)).size);
++      IO.println ("bytes loaded on demand:                " ++ toString (s.regions.map (·.size) |>.sum));
++      IO.println ("lazy overlay constants:                " ++ toString s.numOverlay);
+   pExtDescrs.forM fun extDescr => do
+     IO.println ("extension '" ++ toString extDescr.name ++ "'")
+     -- get state from `checked` at the end if `async`; it would otherwise panic
+@@ -2617,7 +3694,8 @@ where
+ /-- Like `evalConst`, but first check that `constName` indeed is a declaration of type `typeName`.
+     Note that this function cannot guarantee that `typeName` is in fact the name of the type `α`. -/
+ unsafe def evalConstCheck (α) (env : Environment) (opts : Options) (typeName : Name) (constName : Name) : ExceptT String Id α :=
+-  match env.find? constName with
++  -- Lazy parts: only the type is needed; `findConstVal?` does not force a lazily loaded private part
++  match env.findConstVal? constName with
+   | none      => throw ("Unknown constant `" ++ toString constName ++ "`")
+   | some info =>
+     match info.type with
+diff --git a/src/Lean/Meta/LazyDiscrTree.lean b/src/Lean/Meta/LazyDiscrTree.lean
+index 54e08e1..8378dc0 100644
+--- a/src/Lean/Meta/LazyDiscrTree.lean
++++ b/src/Lean/Meta/LazyDiscrTree.lean
+@@ -272,8 +272,28 @@ end MatchClone
+ 
+ /--
+ An unprocessed entry in the lazy discrimination tree.
++
++* `pending`: the remaining subterms to index (`todo`), evaluated in the local context in which
++  they were created, and the value.
++* `deferred` (search index): an entry read from a prebuilt per-module index; only the constant name, the
++  sub-entry index (`some i` for the `i`-th subterm of the root, used for the `mp`/`mpr` entries of
++  an `Iff`), the value and the first `prefix.size` keys of the entry's path below the root are
++  stored (`complete` says that the path ends after them); `consumed` counts the prefix keys
++  already used. Keys beyond the pfx are recomputed from the constant's type exactly as
++  `InitEntry.fromExpr`/`mkSubEntry` and `evalLazyEntry` would have computed them.
+ -/
+-abbrev LazyEntry α := Array Expr × ((LocalContext × LocalInstances) × α)
++inductive LazyEntry (α : Type) where
++  | pending (todo : Array Expr) (lctx : LocalContext × LocalInstances) (v : α)
++  | deferred (declName : Name) (sub : Option Nat) (v : α) (pfx : Array Key) (complete : Bool)
++      (consumed : Nat := 0)
++
++def LazyEntry.value : LazyEntry α → α
++  | .pending _ _ v => v
++  | .deferred _ _ v .. => v
++
++/-- Number of path keys (below the root) stored in a prebuilt entry. 3 covers the `[Eq, *, *, *]`
++dropped-key extraction of library search without any recomputation. -/
++def prefixDepth : Nat := 3
+ 
+ /--
+ Index identifying trie in a discrimination tree.
+@@ -452,29 +472,70 @@ def evalLazyEntry
+     (entry : LazyEntry α)
+     : MatchM α (Array α × TrieIndex × Std.HashMap Key TrieIndex) := do
+   let (values, starIdx, children) := p
+-  let (todo, lctx, v) := entry
+-  if todo.isEmpty then
+-    let values := values.push v
+-    pure (values, starIdx, children)
+-  else
+-    let e    := todo.back!
+-    let todo := todo.pop
+-    let (k, todo) ← withLCtx lctx.1 lctx.2 <| pushArgs false todo e
++  -- place `next` under key `k`
++  let place (k : Key) (next : LazyEntry α) := do
+     if k == .star then
+       if starIdx = 0 then
+-        let starIdx ← newTrie (todo, lctx, v)
++        let starIdx ← newTrie next
+         pure (values, starIdx, children)
+       else
+-        addLazyEntryToTrie starIdx (todo, lctx, v)
++        addLazyEntryToTrie starIdx next
+         pure (values, starIdx, children)
+     else
+       match children[k]? with
+       | none =>
+-        let children := children.insert k (← newTrie (todo, lctx, v))
++        let children := children.insert k (← newTrie next)
+         pure (values, starIdx, children)
+       | some idx =>
+-        addLazyEntryToTrie idx (todo, lctx, v)
++        addLazyEntryToTrie idx next
+         pure (values, starIdx, children)
++  let (todo, lctx, v) ← match entry with
++    | .pending todo lctx v => pure (todo, lctx, v)
++    | .deferred declName sub v pfx complete consumed =>
++      if h : consumed < pfx.size then
++        -- Search index: the next key is stored
++        return ← place pfx[consumed] (.deferred declName sub v pfx complete (consumed + 1))
++      else if complete then
++        return (values.push v, starIdx, children)
++      else
++        -- Search index: recompute what `InitEntry.fromExpr`/`mkSubEntry` would have stored for this
++        -- constant and replay the `consumed` steps already taken along the stored prefix
++        let cv ← getConstVal declName
++        forallTelescope cv.type fun _ type => do
++          let (_, todo) ← rootKey type
++          let mut todo ← match sub with
++            | some i => pure (← rootKey todo[i]!).2
++            | none => pure todo
++          for _ in [0:consumed] do
++            let e := todo.back!
++            let (_, todo') ← pushArgs false todo.pop e
++            todo := todo'
++          pure (todo, ((← getLCtx), (← getLocalInstances)), v)
++  if todo.isEmpty then
++    let values := values.push v
++    pure (values, starIdx, children)
++  else
++    let e    := todo.back!
++    let todo := todo.pop
++    let (k, todo) ← withLCtx lctx.1 lctx.2 <| pushArgs false todo e
++    place k (.pending todo lctx v)
++
++/--
++Search index: the first `prefixDepth` keys of a pending entry's path below the root, and whether the path
++ends after them (computed exactly as `evalLazyEntry` would).
++-/
++def LazyEntry.keyPrefix : LazyEntry α → MetaM (Array Key × Bool)
++  | .deferred _ _ _ pfx complete _ => pure (pfx, complete)
++  | .pending todo lctx _ => withLCtx lctx.1 lctx.2 do
++    let mut todo := todo
++    let mut keys := #[]
++    for _ in [0:prefixDepth] do
++      if todo.isEmpty then break
++      let e := todo.back!
++      let (k, todo') ← pushArgs false todo.pop e
++      todo := todo'
++      keys := keys.push k
++    return (keys, todo.isEmpty)
+ 
+ /--
+ This evaluates all lazy entries in a trie and updates `values`, `starIdx`, and `children`
+@@ -763,7 +824,7 @@ def fromExpr (expr : Expr) (value : α) : MetaM (InitEntry α) := do
+   let linst ← getLocalInstances
+   let lctx := (lctx, linst)
+   let (key, todo) ← LazyDiscrTree.rootKey expr
+-  return { key, entry := (todo, lctx, value) }
++  return { key, entry := .pending todo lctx value }
+ 
+ /--
+ Creates an entry for a subterm of an initial entry.
+@@ -773,9 +834,10 @@ to `whnf`.
+ -/
+ def mkSubEntry (e : InitEntry α) (idx : Nat) (value : α) :
+     MetaM (InitEntry α) := do
+-  let (todo, lctx, _) := e.entry
++  let .pending todo lctx _ := e.entry
++    | throwError "mkSubEntry: expected a pending entry"
+   let (key, todo) ← LazyDiscrTree.rootKey todo[idx]!
+-  return { key, entry := (todo, lctx, value) }
++  return { key, entry := .pending todo lctx value }
+ 
+ end InitEntry
+ 
+@@ -903,16 +965,27 @@ partial def loadImportedModule
+   else
+     pure tree
+ 
++/--
++Search index: `prebuilt m` returns the entries of module `m` from a prebuilt (build-time) index, or `none`
++if the module has no such index, in which case the entries are computed from the module's
++constants with `act` as before.
++-/
++abbrev Prebuilt (α : Type) := ModuleIdx → Option (Array (InitEntry α))
++
++def noPrebuilt : Prebuilt α := fun _ => none
++
+ def createImportedEnvironmentSeq (cctx : Core.Context) (ngen : NameGenerator) (env : Environment)
+     (act : Name → AsyncConstantInfo → MetaM (Array (InitEntry α)))
+-    (start stop : Nat) : BaseIO (InitResults α) := do
++    (start stop : Nat) (prebuilt : Prebuilt α := noPrebuilt) : BaseIO (InitResults α) := do
+       let cacheRef ← IO.mkRef (Cache.empty ngen)
+       go (← ImportData.new) cacheRef {} start stop
+     where go d cacheRef (tree : PreDiscrTree α) (start stop : Nat) : BaseIO _ := do
+             if start < stop then
+               let mname := env.header.moduleNames[start]!
+               let mdata := env.header.moduleData[start]!
+-              let tree ← loadImportedModule cctx env act d cacheRef tree mname mdata
++              let tree ← match prebuilt start with
++                | some es => pure <| es.foldl (fun t e => t.push e.key e.entry) tree
++                | none => loadImportedModule cctx env act d cacheRef tree mname mdata
+               go d cacheRef tree (start+1) stop
+             else
+               toFlat d tree
+@@ -1007,7 +1080,8 @@ def logImportFailure [Monad m] [MonadLog m] [AddMessageContext m] [MonadOptions
+ def createImportedDiscrTree [Monad m] [MonadLog m] [AddMessageContext m] [MonadOptions m] [MonadLiftT BaseIO m]
+     (cctx : Core.Context) (ngen : NameGenerator) (env : Environment)
+     (act : Name → AsyncConstantInfo → MetaM (Array (InitEntry α)))
+-    (constantsPerTask : Nat := 1000) :
++    (constantsPerTask : Nat := 1000) (prebuilt : Prebuilt α := noPrebuilt)
++    (onPreTree : Option (PreDiscrTree α → m Unit) := none) :
+     m (LazyDiscrTree α) := do
+   let n := env.header.moduleData.size
+   let rec
+@@ -1018,14 +1092,14 @@ def createImportedDiscrTree [Monad m] [MonadLog m] [AddMessageContext m] [MonadO
+         let cnt := cnt + mdata.constants.size
+         if cnt > constantsPerTask then
+           let (childNGen, ngen) := ngen.mkChild
+-          let t ← liftM <| createImportedEnvironmentSeq cctx childNGen env act start (idx+1) |>.asTask
++          let t ← liftM <| createImportedEnvironmentSeq cctx childNGen env act start (idx+1) prebuilt |>.asTask
+           go ngen (tasks.push t) (idx+1) 0 (idx+1)
+         else
+           go ngen tasks start cnt (idx+1)
+       else
+         if start < n then
+           let (childNGen, _) := ngen.mkChild
+-          let t ← (createImportedEnvironmentSeq cctx childNGen env act start n).asTask
++          let t ← (createImportedEnvironmentSeq cctx childNGen env act start n prebuilt).asTask
+           pure (tasks.push t)
+         else
+           pure tasks
+@@ -1033,6 +1107,7 @@ def createImportedDiscrTree [Monad m] [MonadLog m] [AddMessageContext m] [MonadO
+   let tasks ← go ngen #[] 0 0 0
+   let r := combineGet default tasks
+   r.errors.forM logImportFailure
++  if let some f := onPreTree then f r.tree
+   pure <| r.tree.toLazy
+ 
+ /-- Creates the core context used for initializing a tree using the current context. -/
+@@ -1052,7 +1127,8 @@ def findImportMatches
+       (droppedKeys : List (List LazyDiscrTree.Key) := [])
+       (constantsPerTask : Nat := 1000)
+       (droppedEntriesRef : Option (IO.Ref (Option (Array α))) := none)
+-      (ty : Expr) : MetaM (MatchResult α) := do
++      (ty : Expr) (prebuilt : Prebuilt α := noPrebuilt)
++      (onPreTree : Option (PreDiscrTree α → MetaM Unit) := none) : MetaM (MatchResult α) := do
+   let cctx ← (read : CoreM Core.Context)
+   let ngen ← getNGen
+   let (cNGen, ngen) := ngen.mkChild
+@@ -1060,7 +1136,7 @@ def findImportMatches
+   let importTree ← (←ref.get).getDM $ do
+     profileitM Exception  "lazy discriminator import initialization" (←getOptions) $ do
+       let t ← createImportedDiscrTree (createTreeCtx cctx) cNGen (←getEnv) addEntry
+-                (constantsPerTask := constantsPerTask)
++                (constantsPerTask := constantsPerTask) (prebuilt := prebuilt) (onPreTree := onPreTree)
+       -- If a reference is provided, extract and append dropped entries
+       if let some droppedRef := droppedEntriesRef then
+         let (extracted, t) ← extractKeys t droppedKeys
+@@ -1155,9 +1231,10 @@ def findMatchesExt
+     (constantsPerTask : Nat := 1000)
+     (droppedEntriesRef : Option (IO.Ref (Option (Array α))) := none)
+     (adjustResult : Nat → α → β)
+-    (ty : Expr) : MetaM (Array β) := do
++    (ty : Expr) (prebuilt : Prebuilt α := noPrebuilt)
++    (onPreTree : Option (PreDiscrTree α → MetaM Unit) := none) : MetaM (Array β) := do
+   let moduleMatches ← findModuleMatches moduleTreeRef ty
+-  let importMatches ← findImportMatches ref addEntry droppedKeys constantsPerTask droppedEntriesRef ty
++  let importMatches ← findImportMatches ref addEntry droppedKeys constantsPerTask droppedEntriesRef ty prebuilt onPreTree
+   return Array.mkEmpty (moduleMatches.size + importMatches.size)
+           |> moduleMatches.appendResultsAux (f := adjustResult)
+           |> importMatches.appendResultsAux (f := adjustResult)
+@@ -1176,8 +1253,9 @@ def findMatches (ref : IO.Ref (Option (LazyDiscrTree α)))
+     (droppedKeys : List (List LazyDiscrTree.Key) := [])
+     (constantsPerTask : Nat := 1000)
+     (droppedEntriesRef : Option (IO.Ref (Option (Array α))) := none)
+-    (ty : Expr) : MetaM (Array α) := do
++    (ty : Expr) (prebuilt : Prebuilt α := noPrebuilt)
++    (onPreTree : Option (PreDiscrTree α → MetaM Unit) := none) : MetaM (Array α) := do
+   -- Pass droppedEntriesRef to also capture star-indexed lemmas from the current module
+   let moduleTreeRef ← createModuleTreeRef addEntry droppedKeys droppedEntriesRef
+   let incPrio _ v := v
+-  findMatchesExt moduleTreeRef ref addEntry droppedKeys constantsPerTask droppedEntriesRef incPrio ty
++  findMatchesExt moduleTreeRef ref addEntry droppedKeys constantsPerTask droppedEntriesRef incPrio ty prebuilt onPreTree
+diff --git a/src/Lean/Meta/Tactic/LibrarySearch.lean b/src/Lean/Meta/Tactic/LibrarySearch.lean
+index 2296198..c6a4ad2 100644
+--- a/src/Lean/Meta/Tactic/LibrarySearch.lean
++++ b/src/Lean/Meta/Tactic/LibrarySearch.lean
+@@ -182,15 +182,187 @@ private def constantsPerImportTask : Nat := 6500
+ private builtin_initialize starLemmasExt : IO.Ref (Option (Array (Name × DeclMod))) ←
+   IO.mkRef .none
+ 
++/-! ## Prebuilt per-module library-search index
++
++The root discrimination-tree key of every constant's type is computed once, when the module is
++elaborated (`recordModuleIndex`, called by the frontend before the `.olean` is written), and stored
++in the module as `IndexEntry`s. The first `exact?`/`apply?` of a process then only merges the
++stored entries of the imported modules (`prebuiltEntries`) instead of walking every imported
++constant's type through `whnfR` and `inferType`; modules without stored entries (built by a
++toolchain without this extension, or before it is available in the import chain) fall back to the
++walk. The set and order of entries is the same as the walk's: `recordModuleIndex` visits the
++module's constants in `mkModuleData` order and applies the same filters; the parts of
++`blacklistInsertion` that depend on the importing environment (`_private` names are candidates
++only for a root with `import all`) are re-applied at import time. Deprecation (`isDeprecated`) and
++reducibility are fixed when a module is written (both attributes can only be set in the defining
++module; `attribute [local reducible]` in the root is the one situation where the stored key can
++differ from a key recomputed in the root — stock computes its process-global tree in whatever
++context the first `exact?` runs in, so this is at most as context-dependent as before).
++-/
++
++/-- One entry of the prebuilt library-search index of a module. -/
++structure IndexEntry where
++  name : Name
++  key  : LazyDiscrTree.Key
++  mod  : DeclMod
++  /-- the first `LazyDiscrTree.prefixDepth` keys below the root -/
++  pfx : Array LazyDiscrTree.Key := #[]
++  /-- the path ends after `pfx` -/
++  complete : Bool := false
++  deriving Inhabited
++
++builtin_initialize indexExt : SimplePersistentEnvExtension IndexEntry (Array IndexEntry) ←
++  registerSimplePersistentEnvExtension {
++    addEntryFn := Array.push
++    addImportedFn := fun _ => #[]
++  }
++
++/-- `LEAN_SEARCH_INDEX=0` ignores stored index entries (walk every constant, as stock). -/
++builtin_initialize searchIndexPrebuilt : Bool ←
++  return (← IO.getEnv "LEAN_SEARCH_INDEX") != some "0"
++
++/-- `LEAN_SEARCH_INDEX_RECORD=0` writes no index entries. -/
++builtin_initialize searchIndexRecord : Bool ←
++  return (← IO.getEnv "LEAN_SEARCH_INDEX_RECORD") != some "0"
++
++/--
++Compute the library-search index entries of the current module (root keys of the types of
++its constants) and add them to the environment, so that they are written to the `.olean`.
++-/
++def recordModuleIndex (env : Environment) (opts : Options) : IO Environment := do
++  if !searchIndexRecord then return env
++  let kenv := env.toKernelEnv
++  -- same order as the `constants` array `mkModuleData` writes at the `.private` level
++  let consts := kenv.constants.foldStage2 (fun cs _ c => cs.push c) #[]
++  let cctx : Core.Context := {
++    fileName := "<librarySearchIndex>", fileMap := default, options := opts, maxHeartbeats := 0 }
++  let mctx : Meta.Context := {
++    keyedConfig := Meta.Config.toConfigWithKey { transparency := .reducible } }
++  let go : MetaM (Array IndexEntry) := do
++    let mut out := #[]
++    for c in consts do
++      if c.isUnsafe then continue
++      if LazyDiscrTree.blacklistInsertion env c.name then continue
++      let es ← try addImport c.name (.ofConstantInfo c) catch _ => pure #[]
++      for e in es do
++        let (pfx, complete) ← try e.entry.keyPrefix catch _ => pure (#[], false)
++        out := out.push { name := c.name, key := e.key, mod := e.entry.value.2, pfx, complete }
++    return out
++  let (entries, _, _) ← go.toIO cctx { env } mctx {}
++  return entries.foldl (fun env e => indexExt.addEntry env e) env
++
++/-!
++### Process-persistent cache of computed entries
++
++For modules built without stored entries (e.g. a Mathlib built by a toolchain without this
++extension), the entries computed by the first walk of a process can be cached on disk
++(`LEAN_SEARCH_INDEX_CACHE_DIR`, one file per import closure, keyed by the module names and the `.olean`
++sizes/mtimes) and are then used like stored entries by every later process (file workers of the
++language server included). The per-module entry lists are derived from the finished
++`PreDiscrTree`: for every root key its entry array is traversed in order and each entry appended
++to its module's list, so re-inserting the lists module by module rebuilds every root array in the
++same order.
++-/
++
++/-- Cached index entries, one array per `ModuleIdx`. -/
++structure IndexCache where
++  mods : Array (Array IndexEntry)
++
++private def searchIndexCacheVersion : UInt64 := 2
++
++builtin_initialize searchIndexCacheDir : Option System.FilePath ← do
++  match ← IO.getEnv "LEAN_SEARCH_INDEX_CACHE_DIR" with
++  | some d => return if d.isEmpty then none else some d
++  | none => return none
++
++builtin_initialize searchIndexVerbose : Bool ← return (← IO.getEnv "LEAN_SEARCH_INDEX_VERBOSE").isSome
++
++/-- Cache key: module names and the sizes/mtimes of their `.olean` files. -/
++private def cacheKey (env : Environment) : IO UInt64 := do
++  let mut h : UInt64 := mixHash 11 searchIndexCacheVersion
++  for m in env.header.moduleNames do
++    h := mixHash h m.hash
++    let md ← (← findOLean m).metadata
++    h := mixHash (mixHash h md.byteSize) (md.modified.sec.toNat.toUInt64)
++  return h
++
++private unsafe def loadCacheUnsafe (path : System.FilePath) : IO (Option IndexCache) := do
++  unless ← path.pathExists do return none
++  let (c, _region) ← CompactedRegion.read (α := IndexCache) path #[]  -- region kept mapped
++  return some c
++
++@[implemented_by loadCacheUnsafe]
++private opaque loadCache (path : System.FilePath) : IO (Option IndexCache)
++
++private unsafe def saveCacheUnsafe (path : System.FilePath) (c : IndexCache) : IO Unit := do
++  if let some dir := path.parent then IO.FS.createDirAll dir
++  let tmp := path.addExtension s!"tmp{← IO.Process.getPID}"
++  let _ ← CompactedRegion.save tmp `_searchIndex c #[] none
++  IO.FS.rename tmp path
++
++@[implemented_by saveCacheUnsafe]
++private opaque saveCache (path : System.FilePath) (c : IndexCache) : IO Unit
++
++/-- Derive the per-module entry lists from a finished pre-discrimination tree (see above). -/
++private def deriveCache (env : Environment) (tree : LazyDiscrTree.PreDiscrTree (Name × DeclMod)) :
++    MetaM IndexCache := withReducible do
++  let mut mods : Array (Array IndexEntry) := Array.replicate env.header.moduleNames.size #[]
++  for (k, i) in tree.roots do
++    for e in tree.tries[i]! do
++      let (name, mod) := e.value
++      if let some m := env.getModuleIdxFor? name then
++        let (pfx, complete) ← try e.keyPrefix catch _ => pure (#[], false)
++        mods := mods.modify m (·.push { name, key := k, mod, pfx, complete })
++  return { mods }
++
++/-- Entries stored in module `m` (or cached for it) as `InitEntry`s, `none` if there are none. -/
++private def prebuiltEntries (env : Environment) (cache : Option IndexCache) :
++    LazyDiscrTree.Prebuilt (Name × DeclMod) := fun m =>
++  let es := indexExt.getModuleEntries env m
++  let es := if es.isEmpty then (cache.bind (·.mods[m.toNat]?)).getD #[] else es
++  if es.isEmpty then none else some <| es.filterMap fun e =>
++    if LazyDiscrTree.blacklistInsertion env e.name then none
++    else
++      let sub := match e.mod with | .none => none | .mp => some 0 | .mpr => some 1
++      some { key := e.key, entry := .deferred e.name sub (e.name, e.mod) e.pfx e.complete }
++
++/-- The prebuilt-entry source for this environment and, if a cache file is to be written, the
++callback that writes it from the finished pre-tree. -/
++private def searchIndexSources (env : Environment) :
++    IO (LazyDiscrTree.Prebuilt (Name × DeclMod) ×
++        Option (LazyDiscrTree.PreDiscrTree (Name × DeclMod) → MetaM Unit)) := do
++  if !searchIndexPrebuilt then return (LazyDiscrTree.noPrebuilt, none)
++  let some dir := searchIndexCacheDir | return (prebuiltEntries env none, none)
++  let path ← try
++      let key ← cacheKey env
++      pure (some (dir / s!"librarySearch-{key}.idx"))
++    catch _ => pure none
++  let some path := path | return (prebuiltEntries env none, none)
++  match ← (loadCache path).toBaseIO with
++  | .ok (some c) =>
++    if searchIndexVerbose then IO.eprintln s!"search-index: library-search cache {path} (hit)"
++    return (prebuiltEntries env (some c), none)
++  | _ =>
++    if searchIndexVerbose then IO.eprintln s!"search-index: library-search cache {path} (miss)"
++    let writer : LazyDiscrTree.PreDiscrTree (Name × DeclMod) → MetaM Unit := fun tree => do
++      let c ← profileitM Exception "library-search cache derivation" (← getOptions) (deriveCache env tree)
++      match ← (saveCache path c).toBaseIO with
++      | .ok _ => if searchIndexVerbose then IO.eprintln s!"search-index: wrote {path}"
++      | .error e => if searchIndexVerbose then IO.eprintln s!"search-index: could not write {path}: {e}"
++    return (prebuiltEntries env none, some writer)
++
+ /-- Create function for finding relevant declarations.
+     Also captures dropped entries in starLemmasExt for fallback search. -/
+ def libSearchFindDecls (ty : Expr) : MetaM (Array (Name × DeclMod)) := do
+   let droppedRef := starLemmasExt
++  -- the prebuilt sources (and the cache file) are only consulted when the import tree is built
++  let (prebuilt, onPreTree) ← if (← ext.get).isNone then searchIndexSources (← getEnv)
++    else pure (LazyDiscrTree.noPrebuilt, none)
+   findMatches ext addImport
+       (droppedKeys := droppedKeys)
+       (constantsPerTask := constantsPerImportTask)
+       (droppedEntriesRef := some droppedRef)
+-      ty
++      ty prebuilt onPreTree
+ 
+ /-- Get star-indexed lemmas (lazily computed during tree initialization). -/
+ def getStarLemmas : MetaM (Array (Name × DeclMod)) := do
+diff --git a/src/Lean/MonadEnv.lean b/src/Lean/MonadEnv.lean
+index e8d664d..1af7d51 100644
+--- a/src/Lean/MonadEnv.lean
++++ b/src/Lean/MonadEnv.lean
+@@ -34,7 +34,10 @@ def isInductive [Monad m] [MonadEnv m] (declName : Name) : m Bool :=
+   return isInductiveCore (← getEnv) declName
+ 
+ def isRecCore (env : Environment) (declName : Name) : Bool :=
+-  env.findAsync? declName matches some { kind := .recursor, .. }
++  -- Search index: a recursor is never weakened in the exported view, so the question is answered without
++  -- loading a lazily deferred private part; this is what made `exact?`'s index build touch
++  -- the private part of every imported module (`blacklistInsertion` → `allowCompletion` → here).
++  env.findKindNoLoad? declName == some .recursor
+ 
+ def isRec [Monad m] [MonadEnv m] (declName : Name) : m Bool :=
+   return isRecCore (← getEnv) declName
+diff --git a/src/Lean/Parser/Extension.lean b/src/Lean/Parser/Extension.lean
+index 82c790d..76e73ae 100644
+--- a/src/Lean/Parser/Extension.lean
++++ b/src/Lean/Parser/Extension.lean
+@@ -255,7 +255,8 @@ def ensureConstantParserAlias (aliasName : Name) : IO Unit :=
+ unsafe def mkParserOfConstantUnsafe (constName : Name) (compileParserDescr : ParserDescr → ImportM Parser) : ImportM (Bool × Parser) := do
+   let env  := (← read).env
+   let opts := (← read).opts
+-  match env.find? constName with
++  -- Lazy parts: only the type is needed; `findConstVal?` does not force a lazily loaded private part
++  match env.findConstVal? constName with
+   | none      => throw ↑s!"Unknown constant `{constName}`"
+   | some info =>
+     match info.type with
+diff --git a/src/include/lean/lean.h b/src/include/lean/lean.h
+index 33c8773..eec77ed 100644
+--- a/src/include/lean/lean.h
++++ b/src/include/lean/lean.h
+@@ -724,6 +724,32 @@ static inline bool lean_is_shared(lean_object * o) {
+ LEAN_EXPORT void lean_mark_mt(lean_object * o);
+ LEAN_EXPORT void lean_mark_persistent(lean_object * o);
+ 
++/* Persistent address ranges (no-touch fork experiment).
++
++   The olean loader (`src/library/module.cpp`, macOS) reserves the free part of the address space
++   above 1 TB and maps every compacted region file into that reservation. Every object whose
++   address lies inside one of these ranges is therefore an object of a memory-mapped compacted
++   region: its reference count is 0 (persistent) and `lean_inc`/`lean_dec` are no-ops on it, apart
++   from reading its header, which faults in the page. `lean_is_in_persistent_address_range` answers
++   "is `o` such an object?" without dereferencing it, so that code that only needs to *store* a
++   pointer to a compacted object (e.g. `finalizeImport` building the constant maps,
++   `lean_mark_persistent`) can skip the reference-count access and leave the page untouched.
++
++   On macOS the ranges are the loader's reservations, registered before any file is mapped into
++   them and never unregistered (an unmapped region turns back into an inaccessible reservation, so
++   no valid pointer into the range can exist that is not a compacted-region object). On Linux
++   (no reservation: it would double the VMA count against `vm.max_map_count`) the loader registers
++   the exact page-rounded range of every region it memory-mapped at its saved address, and
++   unregisters it when the region is freed. On other platforms/configurations no range is
++   registered and the query is always false. */
++LEAN_EXPORT void lean_register_persistent_address_range(uintptr_t start, uintptr_t end);
++LEAN_EXPORT void lean_unregister_persistent_address_range(uintptr_t start, uintptr_t end);
++LEAN_EXPORT bool lean_is_in_persistent_address_range(void const * o);
++/* `a[i]` (owned result), but without reading the header of the element when it lies in a
++   persistent address range: the element is persistent (rc = 0), so the skipped `lean_inc` would
++   have been a no-op. Precondition: `i < lean_array_size(a)`. */
++LEAN_EXPORT lean_obj_res lean_array_fget_no_touch(b_lean_obj_arg a, b_lean_obj_arg i);
++
+ static inline void lean_set_st_header(lean_object * o, unsigned tag, unsigned other) {
+     lean_internal_set_rc(o, 1);
+     o->m_tag      = tag;
+diff --git a/src/library/module.cpp b/src/library/module.cpp
+index be31567..b9f0723 100644
+--- a/src/library/module.cpp
++++ b/src/library/module.cpp
+@@ -57,8 +57,210 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
+ #endif
+ #endif
+ 
++// Address reservation (macOS only): keep XNU's free-space "hole list" short while mapping thousands of
++// `.olean` parts at their hinted addresses. See `olean_address_reserver` below.
++#if defined(__APPLE__) && defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
++#define LEAN_OLEAN_ADDRESS_RESERVE 1
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#include <map>
++#include <mutex>
++#include <cstdlib>
++#endif
++
++// On Linux: no address-space reservation (Linux finds gaps in O(log n) and the reservation
++// would leave one extra VMA per region against `vm.max_map_count`, whose 65,530 default a Mathlib
++// import already approaches with its ~52k file mappings). Instead every region that lands at its
++// saved address is registered as a persistent address range (`lean_register_persistent_address_range`)
++// so that `finalizeImport` / `lean_mark_persistent` can recognise pointers into it without
++// touching the page. `LEAN_MMAP_RESERVE=0` disables the registration (stock behaviour).
++#if defined(__linux__) && defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
++#define LEAN_OLEAN_RANGE_REGISTER 1
++#include <cstdlib>
++#endif
++
+ namespace lean {
+ 
++#ifdef LEAN_OLEAN_ADDRESS_RESERVE
++namespace {
++/*
++Background. `lean_compacted_region_read` maps every `.olean*` / `.ir*` part at the pseudo-random
++47-bit address stored in its header (`olean_header::base_addr`, a hash of the module name).
++`import Mathlib` performs ~52,000 such hinted `mmap`s. XNU's `vm_map_enter` locates the free
++range ("hole") containing a caller-supplied address by walking a singly-linked, address-sorted
++hole list from the bottom of the address space, and every mapping dropped into a fresh part of the
++space adds a hole to that list. With addresses spread uniformly over the 47-bit space this makes
++the k-th mapping cost O(k): ~7 s of kernel time for a Mathlib import on an M2 Pro, i.e. about half
++of the warm wall time. (Linux locates gaps with an augmented red-black tree and does not have this
++problem; the code below is compiled on macOS only.)
++
++Fix. On first use, reserve every free range of the address space above `floor_addr` with a single
++`PROT_NONE` anonymous mapping each (a handful of `mmap`s covering ~126 TB of virtual space; they
++are never touched, so they cost no memory). Afterwards the hole list contains only the holes below
++`floor_addr` plus the few not-yet-mapped fragments, and a region file whose range lies inside a
++reservation is mapped with `MAP_FIXED` *over* the reservation: the kernel carves the file mapping
++out of the reservation entry (an O(log n) red-black-tree lookup) and no hole is ever created.
++Ranges are tracked in user space so that two files whose ranges overlap (a base-address collision)
++are handled exactly as today: the second one does not get its address and falls back to
++`malloc` + `read` + relocation. Files below `floor_addr` (~1 % of a Mathlib closure) and any file
++whose range is not fully reserved keep using the original hinted `mmap`.
++
++The reservation leaves the bottom `floor_addr` bytes (1 TB) alone for the heap, thread stacks,
++dyld, and the system allocator; mimalloc's aligned-allocation hints (2–30 TB) may now be refused
++by the kernel, which mimalloc handles by falling back to an unhinted `mmap` (`unix_mmap`), so no
++allocation can fail because of the reservation.
++
++Semantics are unchanged: which regions land at their saved address (and therefore take the
++relocation-free fast path in `region_reader::read`) is decided exactly as before — only the kernel
++bookkeeping differs. `LEAN_MMAP_RESERVE=0` in the environment restores the original behaviour
++(useful for A/B measurements).
++*/
++class olean_address_reserver {
++    std::mutex m_mutex;
++    bool m_initialized = false;
++    bool m_enabled = false;
++    // Reserved (PROT_NONE) address ranges that are not yet occupied by a region: start -> end.
++    // Disjoint, sorted, coalesced.
++    std::map<uintptr_t, uintptr_t> m_free;
++    uintptr_t m_page_size = 0;
++
++    static constexpr uintptr_t floor_addr = uintptr_t(1) << 40;              // 1 TB
++    // `base_addr`s are generated modulo 0x7f0000000000 (`mk_base_addr`); leave room for the file.
++    static constexpr uintptr_t ceil_addr  = uintptr_t(0x7f0000000000) + (uintptr_t(1) << 32);
++
++    void insert_free(uintptr_t s, uintptr_t e) {
++        // coalesce with neighbours
++        auto it = m_free.lower_bound(s);
++        if (it != m_free.begin()) {
++            auto prev = std::prev(it);
++            if (prev->second == s) { s = prev->first; m_free.erase(prev); }
++        }
++        it = m_free.find(e);
++        if (it != m_free.end()) { e = it->second; m_free.erase(it); }
++        m_free[s] = e;
++    }
++
++    // Reserve the free range [s, e). We deliberately do not use `MAP_FIXED` here: another thread
++    // may have mapped something into the hole since we enumerated it, and `MAP_FIXED` would
++    // silently replace it. With a plain hint the kernel returns a different address in that case
++    // and we simply retry the enumeration from `s`.
++    bool reserve(uintptr_t s, uintptr_t e) {
++        void * p = mmap(reinterpret_cast<void *>(s), e - s, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
++        if (p == MAP_FAILED) return false;
++        if (reinterpret_cast<uintptr_t>(p) != s) { munmap(p, e - s); return false; }
++        insert_free(s, e);
++        // Everything that will ever be accessible inside [s, e) is a compacted region mapped by
++        // `map_file`: tell the runtime so that it can recognise pointers into regions by address
++        // (`lean_is_in_persistent_address_range`), without dereferencing them.
++        lean_register_persistent_address_range(s, e);
++        return true;
++    }
++
++    void initialize() {
++        m_initialized = true;
++        if (char const * v = getenv("LEAN_MMAP_RESERVE")) {
++            if (v[0] == '0' && v[1] == '\0') return;
++        }
++        m_page_size = static_cast<uintptr_t>(getpagesize());
++        mach_port_t task = mach_task_self();
++        uintptr_t cursor = floor_addr;
++        int retries = 0;
++        while (cursor < ceil_addr) {
++            mach_vm_address_t addr = cursor;
++            mach_vm_size_t size = 0;
++            vm_region_basic_info_data_64_t info;
++            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++            mach_port_t obj = MACH_PORT_NULL;
++            kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
++                                              reinterpret_cast<vm_region_info_t>(&info), &count, &obj);
++            if (obj != MACH_PORT_NULL) mach_port_deallocate(task, obj);
++            uintptr_t hole_s = cursor;
++            uintptr_t hole_e = kr == KERN_SUCCESS ? std::min<uintptr_t>(addr, ceil_addr) : ceil_addr;
++            if (hole_e > hole_s && !reserve(hole_s, hole_e)) {
++                // Something else got mapped there concurrently (or the kernel refused): re-scan
++                // this hole, but give up on it after a few attempts so that we cannot spin.
++                if (++retries < 8) continue;
++                retries = 0;
++            } else {
++                retries = 0;
++            }
++            if (kr != KERN_SUCCESS) break;
++            cursor = std::max<uintptr_t>(hole_e, static_cast<uintptr_t>(addr + size));
++        }
++        m_enabled = !m_free.empty();
++    }
++
++    bool covers(uintptr_t s, uintptr_t e, std::map<uintptr_t, uintptr_t>::iterator & it) {
++        it = m_free.upper_bound(s);
++        if (it == m_free.begin()) return false;
++        --it;
++        return it->first <= s && e <= it->second;
++    }
++
++public:
++    // Try to map `size` bytes of `fd` exactly at `base_addr` by carving the range out of a
++    // reservation. Returns the mapping (== `base_addr`) or `nullptr` when the range is not (fully)
++    // reserved-and-free or the `mmap` failed; the caller then uses the ordinary hinted path.
++    char * map_file(char * base_addr, size_t size, int fd) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (!m_initialized) initialize();
++        if (!m_enabled) return nullptr;
++        uintptr_t s = reinterpret_cast<uintptr_t>(base_addr);
++        if (s % m_page_size != 0 || size == 0) return nullptr;
++        uintptr_t e = (s + size + m_page_size - 1) & ~(m_page_size - 1);
++        std::map<uintptr_t, uintptr_t>::iterator it;
++        if (!covers(s, e, it)) return nullptr;
++        void * p = mmap(base_addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
++        if (p == MAP_FAILED) return nullptr;
++        lean_always_assert(p == base_addr);
++        // carve [s, e) out of the free range
++        uintptr_t fs = it->first, fe = it->second;
++        m_free.erase(it);
++        if (fs < s) m_free[fs] = s;
++        if (e < fe) m_free[e] = fe;
++        return base_addr;
++    }
++
++    // Release a region mapping. If the range lies in the reserved part of the address space, turn
++    // it back into a `PROT_NONE` reservation (which unmaps the file) so that it stays usable by
++    // `map_file` and does not become a hole; otherwise plain `munmap`.
++    void unmap(char * buffer, size_t size) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        uintptr_t s = reinterpret_cast<uintptr_t>(buffer);
++        if (m_enabled && s >= floor_addr && s < ceil_addr && s % m_page_size == 0) {
++            uintptr_t e = (s + size + m_page_size - 1) & ~(m_page_size - 1);
++            void * p = mmap(buffer, e - s, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED, -1, 0);
++            if (p == buffer) { insert_free(s, e); return; }
++        }
++        lean_always_assert(munmap(buffer, size) == 0);
++    }
++};
++
++olean_address_reserver & get_olean_address_reserver() {
++    static olean_address_reserver * r = new olean_address_reserver(); // intentionally leaked
++    return *r;
++}
++}
++#endif
++
++#ifdef LEAN_OLEAN_RANGE_REGISTER
++namespace {
++bool olean_range_register_enabled() {
++    static bool enabled = [] {
++        if (char const * v = getenv("LEAN_MMAP_RESERVE")) {
++            if (v[0] == '0' && v[1] == '\0') return false;
++        }
++        return true;
++    }();
++    return enabled;
++}
++uintptr_t olean_range_end(char * buffer, size_t size) {
++    uintptr_t page = static_cast<uintptr_t>(getpagesize());
++    return (reinterpret_cast<uintptr_t>(buffer) + size + page - 1) & ~(page - 1);
++}
++}
++#endif
++
+ namespace {
+ /** Read up to `n` bytes from `fd` into `buf`, handling `EINTR`. */
+ ssize_t readn(int fd, void * buf, size_t n) {
+@@ -265,13 +467,16 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
+     return relocs;
+ }
+ 
+-extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
+-                                                           b_obj_arg odep_regions, obj_arg oprev,
+-                                                           uint8 allow_closures_u8, object *) {
++// Olean layout hints: objects to be emitted at the front of the region, so that reading the
++// records does not fault in the much larger content they point at.
++typedef std::vector<std::pair<object *, bool>> front_hints;
++
++static object * compacted_region_save_core(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
++                                           std::vector<region_view> dep_regions, obj_arg oprev,
++                                           bool allow_closures, front_hints const & front) {
+     // `mmap` addresses must be page-aligned. The default (non-huge) page size on x86-64 is 4KB;
+     // `MapViewOfFileEx` addresses must be aligned to the "memory allocation granularity" (64KB).
+     const size_t ALIGN = 1LL<<16;
+-    bool allow_closures = allow_closures_u8 != 0;
+ 
+     option_ref<object_ref> prev(oprev);
+     object_ref cs_obj;
+@@ -292,12 +497,13 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
+         // so reserve a bit of space for them (0x7fff...-0x7f00... = 1TB).
+         base_addr = base_addr % 0x7f0000000000;
+         base_addr = base_addr & ~(ALIGN - 1);
+-        std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
+         cs_obj = object_ref(mk_compactor(reinterpret_cast<void *>(base_addr),
+                                          std::move(dep_regions), allow_closures));
+     }
+ 
+     object_compactor & compactor = *to_compactor(cs_obj.raw());
++    for (std::pair<object *, bool> const & f : front)
++        compactor.add_front(f.first, f.second);
+ 
+     char const * olean_fn = lean_string_cstr(ofname);
+     // We first write to a temp file and then move it to the correct path (possibly deleting an
+@@ -430,6 +636,61 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
+     return io_result_mk_ok(cs_obj.steal());
+ }
+ 
++extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
++                                                           b_obj_arg odep_regions, obj_arg oprev,
++                                                           uint8 allow_closures_u8, object *) {
++    return compacted_region_save_core(ofname, mod, odata, extract_dep_regions(odep_regions), oprev,
++                                      allow_closures_u8 != 0, front_hints());
++}
++
++/* Olean layout: `Lean.saveModuleDataPart`. Same as `lean_compacted_region_save` (v2 format, no dep regions,
++   no closures) for a `ModuleData` root, but with layout hints so that everything `importModules`
++   touches sits together at the front of the file, in this order:
++
++     root slot | `constNames` (the `Name` objects) | the `ConstantInfo` shells (per constant:
++     `ConstantInfo` ctor, its `*Val` structure, its `ConstantVal`) | `imports`, the arrays,
++     `extraConstNames`, the extension `entries` | type/value expression trees, level params, ...
++
++   Without the hints the compactor's post-order traversal puts each `ConstantInfo` right after its
++   own expression trees, so that touching one shell per constant faults in most of the file.
++   The object graph, sharing, file format and reader are unchanged; only the emission order is.
++   `LEAN_OLEAN_LAYOUT=0` restores the stock order; `LEAN_COMPACT_DUMP=1` prints the layout
++   (offset of each reserved shell) to stderr. */
++extern "C" LEAN_EXPORT object * lean_save_module_data_part(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
++                                                           obj_arg oprev, object *) {
++    static bool const layout_enabled = [] {
++        char const * v = std::getenv("LEAN_OLEAN_LAYOUT");
++        return !(v && v[0] == '0');
++    }();
++    front_hints front;
++    if (layout_enabled && !lean_is_scalar(odata) && lean_ptr_tag(odata) <= LeanMaxCtorTag
++            && lean_ctor_num_objs(odata) >= 3) {
++        // `ModuleData` object fields: 0 `imports`, 1 `constNames`, 2 `constants`, ...
++        object * const_names = lean_ctor_get(odata, 1);
++        object * constants   = lean_ctor_get(odata, 2);
++        front.emplace_back(const_names, false);
++        if (lean_is_array(constants)) {
++            for (size_t i = 0; i < lean_array_size(constants); i++) {
++                // Hints are processed innermost-first (`ConstantVal`, `*Val`, `ConstantInfo`): when
++                // a shell already exists in an earlier part of the same module, each wrapper then
++                // finds all its children compacted and is deduplicated as in the stock layout
++                // instead of being reserved (and duplicated) — olean-layout open issue #1. The three objects
++                // still end up contiguous, in that order.
++                object * cinfo = lean_array_get_core(constants, i);      // `ConstantInfo.<k>Info val`
++                if (lean_is_scalar(cinfo) || lean_ptr_tag(cinfo) > LeanMaxCtorTag || lean_ctor_num_objs(cinfo) < 1) continue;
++                object * val = lean_ctor_get(cinfo, 0);                  // `<Kind>Val extends ConstantVal`
++                bool val_ok = !(lean_is_scalar(val) || lean_ptr_tag(val) > LeanMaxCtorTag || lean_ctor_num_objs(val) < 1);
++                object * cval = val_ok ? lean_ctor_get(val, 0) : nullptr; // `ConstantVal { name, levelParams, type }`
++                bool cval_ok = val_ok && !(lean_is_scalar(cval) || lean_ptr_tag(cval) > LeanMaxCtorTag);
++                if (cval_ok) front.emplace_back(cval, true);
++                if (val_ok)  front.emplace_back(val, true);
++                front.emplace_back(cinfo, true);
++            }
++        }
++    }
++    return compacted_region_save_core(ofname, mod, odata, std::vector<region_view>(), oprev, false, front);
++}
++
+ static object * mk_compacted_region(b_obj_arg ofname, object * root,
+                                     char * buffer, size_t base_addr, size_t full_sz, bool is_mmap) {
+     object * r = lean_alloc_ctor(0, 2, sizeof(size_t) * 3 + 1);
+@@ -532,14 +793,29 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
+             | MAP_FIXED_NOREPLACE
+ #endif
+             ;
++#ifdef LEAN_OLEAN_ADDRESS_RESERVE
++        // Fast path (macOS): carve the file out of the pre-reserved address space, see
++        // `olean_address_reserver`. Falls through to the hinted `mmap` when not applicable.
++        buffer = get_olean_address_reserver().map_file(base_addr, size, fd.get());
++        if (buffer) {
++            is_mmap = true;
++        } else
++#endif
++        {
+         buffer = static_cast<char *>(mmap(base_addr, size, PROT_READ | PROT_WRITE,
+             mmap_flags, fd.get(), 0));
+         if (buffer != MAP_FAILED && buffer == base_addr) {
+             is_mmap = true;
++#ifdef LEAN_OLEAN_RANGE_REGISTER
++            if (olean_range_register_enabled())
++                lean_register_persistent_address_range(reinterpret_cast<uintptr_t>(buffer),
++                                                       olean_range_end(buffer, size));
++#endif
+         } else {
+             if (buffer != MAP_FAILED) munmap(buffer, size);
+             buffer = nullptr;
+         }
++        }
+ #endif
+ #endif
+ 
+@@ -638,7 +914,14 @@ extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object
+ #endif
+ #ifdef LEAN_WINDOWS
+         lean_always_assert(UnmapViewOfFile(buffer));
++#elif defined(LEAN_OLEAN_ADDRESS_RESERVE)
++        get_olean_address_reserver().unmap(buffer, full_sz);
+ #else
++#ifdef LEAN_OLEAN_RANGE_REGISTER
++        // unregister first: after `munmap` the range may be reused by heap mappings
++        lean_unregister_persistent_address_range(reinterpret_cast<uintptr_t>(buffer),
++                                                 olean_range_end(buffer, full_sz));
++#endif
+         lean_always_assert(munmap(buffer, full_sz) == 0);
+ #endif
+     } else {
+diff --git a/src/runtime/compact.cpp b/src/runtime/compact.cpp
+index 73c9a4e..f3f4217 100644
+--- a/src/runtime/compact.cpp
++++ b/src/runtime/compact.cpp
+@@ -8,6 +8,8 @@ Author: Leonardo de Moura
+ #include <string>
+ #include <vector>
+ #include <cstring>
++#include <cstdlib>
++#include <cstdio>
+ #include <lean/lean.h>
+ #include "runtime/hash.h"
+ #include "runtime/compact.h"
+@@ -458,13 +460,80 @@ tag_counter_manager g_tag_counter_manager;
+ 
+ #endif
+ 
++// Shallow reservation (see `add_front`): copy the constructor object `o` to the current end of the
++// buffer, register it in the object table so that all references to `o` resolve to this copy, and
++// remember it so that `compact_pending` can compact its children and patch the child pointers later.
++// The copy is deliberately not entered into the max-sharing table: its contents are not final yet,
++// and (for the intended use, `ConstantInfo` shells) no structurally equal object exists anyway.
++static bool const g_compact_dump = [] { char const * v = std::getenv("LEAN_COMPACT_DUMP"); return v && v[0] == '1'; }();
++
++void object_compactor::reserve_shallow(object * o) {
++    lean_assert(!lean_is_scalar(o) && lean_ptr_tag(o) <= LeanMaxCtorTag);
++    object * new_o = copy_object(o);
++    size_t off = reinterpret_cast<char *>(new_o) - static_cast<char *>(m_begin);
++    save(o, new_o);
++    m_pending.emplace_back(off, o);
++}
++
++void object_compactor::process_front() {
++    std::vector<std::pair<object *, bool>> front;
++    front.swap(m_front);
++    for (std::pair<object *, bool> const & f : front) {
++        object * o = f.first;
++        if (lean_is_scalar(o) || m_obj_table.find(o) != m_obj_table.end())
++            continue;
++        if (!f.second || lean_ptr_tag(o) > LeanMaxCtorTag) {
++            to_offset(o);
++            continue;
++        }
++        // If every child is already compacted (e.g. a shell shared with a previous part whose
++        // expression trees were emitted there), the ordinary path costs nothing extra and keeps
++        // the max-sharing dedup; otherwise reserve the shell and defer its children.
++        bool children_known = true;
++        unsigned num_objs = lean_ctor_num_objs(o);
++        for (unsigned i = 0; i < num_objs && children_known; i++) {
++            object * c = cnstr_get(o, i);
++            children_known = lean_is_scalar(c) || m_obj_table.find(c) != m_obj_table.end();
++        }
++        if (children_known) {
++            to_offset(o);
++        } else {
++            reserve_shallow(o);
++        }
++    }
++}
++
++void object_compactor::compact_pending() {
++    // `m_pending` may not grow while we iterate (nothing reserves during `to_offset`), but the
++    // buffer may be reallocated, hence the offset-based addressing.
++    for (size_t k = 0; k < m_pending.size(); k++) {
++        size_t off = m_pending[k].first;
++        object * o = m_pending[k].second;
++        unsigned num_objs = lean_ctor_num_objs(o);
++        for (unsigned i = 0; i < num_objs; i++) {
++            object_offset c = to_offset(cnstr_get(o, i));
++            object * new_o = reinterpret_cast<object *>(static_cast<char *>(m_begin) + off);
++            lean_ctor_set(new_o, i, c);
++        }
++    }
++    if (g_compact_dump) {
++        for (std::pair<size_t, object *> const & p : m_pending)
++            fprintf(stderr, "compact-dump reserved off=%zu tag=%u size=%zu\n", p.first,
++                    static_cast<unsigned>(lean_ptr_tag(p.second)), lean_object_byte_size(p.second));
++        fprintf(stderr, "compact-dump region-size=%zu reserved=%zu\n", size(), m_pending.size());
++    }
++    m_pending.clear();
++}
++
+ void object_compactor::operator()(object * o) {
+     lean_assert(m_tmp.empty());
+     // Allocate the root-address slot first (see below). We store an offset rather
+     // than a pointer because `m_begin` may be reallocated while compacting `o`.
+     size_t root_offset =
+       static_cast<char *>(alloc(sizeof(object_offset))) - static_cast<char *>(m_begin);
++    process_front();
+     object_offset off = to_offset(o);
++    compact_pending();
+     object_offset * root = reinterpret_cast<object_offset *>(static_cast<char *>(m_begin) + root_offset);
+     *root = off;
+ }
+diff --git a/src/runtime/compact.h b/src/runtime/compact.h
+index ce47209..109ece2 100644
+--- a/src/runtime/compact.h
++++ b/src/runtime/compact.h
+@@ -51,6 +51,13 @@ class LEAN_EXPORT object_compactor {
+     std::vector<lib_info> m_libs;
+     // Buffer-relative byte offsets of every compacted closure's `m_fun` field
+     std::vector<size_t> m_closure_offsets;
++    // Layout hints (see `add_front`): objects to emit at the front of the next region, in order.
++    // `second` = shallow: only the object itself is reserved up front, its children are compacted
++    // after the rest of the graph.
++    std::vector<std::pair<object *, bool>> m_front;
++    // Shallowly reserved constructor objects whose child pointers still have to be filled in:
++    // (buffer-relative offset of the reserved copy, source heap object).
++    std::vector<std::pair<size_t, object *>> m_pending;
+     bool m_allow_closures = false;
+     // On-disk base address used for `mmap`ing compacted regions without relocations
+     // References within the compacted region are rewritten by subtracting `m_begin` and adding `m_base_addr`
+@@ -78,6 +85,9 @@ class LEAN_EXPORT object_compactor {
+     object_offset insert_ref(object * o);
+     object_offset insert_mpz(object * o);
+     object_offset insert_closure(object * o);
++    void reserve_shallow(object * o);
++    void process_front();
++    void compact_pending();
+ public:
+     object_compactor(void * base_addr = nullptr, std::vector<region_view> dep_regions = {},
+                      bool allow_closures = false);
+@@ -87,6 +97,16 @@ public:
+     object_compactor operator=(object_compactor const &) = delete;
+     object_compactor operator=(object_compactor &&) = delete;
+     void operator()(object * o);
++    /** Layout hint for the next `operator()` call: emit `o` at the front of the region, right after
++        the root slot, before the ordinary post-order traversal of the root reaches it. With
++        `shallow = false` the whole subgraph of `o` is compacted first (post-order, max-sharing as
++        usual). With `shallow = true` only the constructor object `o` itself is copied to the front;
++        its children are compacted after the entire graph reachable from the root has been emitted,
++        and the reserved copy's child pointers are patched then. Sharing is unaffected: the reserved
++        copy is registered in the object table, so every other path to `o` resolves to the same
++        address. Objects that are already compacted (or scalars, or non-constructors) are ignored or
++        compacted normally. Hints are consumed by the next `operator()` call. */
++    void add_front(object * o, bool shallow) { m_front.emplace_back(o, shallow); }
+     size_t size() const { return static_cast<char*>(m_end) - static_cast<char*>(m_begin); }
+     void const * data() const { return m_begin; }
+     // Allocate `sz` bytes of zeroed memory.
+diff --git a/src/runtime/io.cpp b/src/runtime/io.cpp
+index c0973b8..720e27e 100644
+--- a/src/runtime/io.cpp
++++ b/src/runtime/io.cpp
+@@ -1169,6 +1169,31 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
+ #endif
+ }
+ 
++/*
++Fork (index-directory bounds): free space, in bytes, on the filesystem that holds `path`.
++
++Used by the side caches to stop writing when the disk is nearly full. One `statfs` (a few
++microseconds), so it can be asked on every write attempt without memoising. Every failure —
++a bad path, an embedded NUL, a filesystem that does not answer — reports `0`, which the
++callers read as "unknown" and treat as "do not block the write".
++
++@[extern "lean_io_free_disk_space"] opaque freeDiskSpace : @& String -> IO UInt64
++*/
++extern "C" LEAN_EXPORT obj_res lean_io_free_disk_space(b_obj_arg path) {
++    uint64_t free_bytes = 0;
++    const char * fname = string_cstr(path);
++    if (strlen(fname) == lean_string_size(path) - 1) {
++        uv_fs_t req;
++        int ret = uv_fs_statfs(NULL, &req, fname, NULL);
++        if (ret >= 0 && req.ptr != NULL) {
++            uv_statfs_t * st = static_cast<uv_statfs_t *>(req.ptr);
++            free_bytes = st->f_bsize * st->f_bavail;
++        }
++        uv_fs_req_cleanup(&req);
++    }
++    return io_result_mk_ok(lean_box_uint64(free_bytes));
++}
++
+ extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
+     const char* str = string_cstr(p);
+     if (strlen(str) != lean_string_size(p) - 1) {
+diff --git a/src/runtime/object.cpp b/src/runtime/object.cpp
+index 5237296..43ee3b2 100644
+--- a/src/runtime/object.cpp
++++ b/src/runtime/object.cpp
+@@ -5,6 +5,8 @@ Released under Apache 2.0 license as described in the file LICENSE.
+ Author: Leonardo de Moura
+ */
+ #include <atomic>
++#include <mutex>
++#include <map>
+ #include <string>
+ #include <algorithm>
+ #include <vector>
+@@ -569,6 +571,137 @@ extern "C" LEAN_EXPORT b_obj_res lean_thunk_get_core(b_obj_arg t) {
+ 
+ extern "C" void lean_mark_persistent(object * o);
+ 
++// Persistent address ranges, see `lean_register_persistent_address_range` in `lean.h`.
++//
++// Two producers: on macOS the olean loader registers its 2-6 large address-space reservations
++// (address reservation) before any file is mapped into them; on Linux it registers the exact page-rounded range of
++// every compacted region that was memory-mapped at its saved address (~52k ranges for a Mathlib
++// import) and unregisters it again when the region is freed. Writers keep a sorted map under a
++// mutex; readers binary-search an immutable sorted-array snapshot that is rebuilt lazily (by the
++// first reader after a change) and published with an atomic pointer, so a lookup is lock-free:
++// one acquire load, two compares against a bounding box and ~16 compares in the array. Retired
++// snapshots are kept (not freed) so that a reader can never observe a dangling snapshot; a
++// snapshot is rebuilt once per import batch, so this leaks ~16 bytes per range per import.
++// The bounding box rejects heap pointers without touching the array: on Linux the heap and the
++// binary live far above the olean address range (`mk_base_addr` < 0x7f0000000000; PIE/brk/mmap
++// areas at 0xaaaa.../0xffff... on arm64, 0x5555.../0x7fff... on x86-64).
++namespace {
++struct persistent_range { uintptr_t m_start; uintptr_t m_end; };
++// Snapshot: the sorted ranges plus a bucket index over the address space (4 GB buckets):
++// `m_index[b]` is the number of ranges whose start lies below bucket `b`, so the ranges that can
++// contain an address in bucket `b` are `m_ranges[m_index[b] - 1 .. m_index[b + 1])` — about 1.6 of
++// them for a Mathlib import. A lookup is therefore 2-3 dependent loads instead of a ~16-step
++// binary search over an 840 KB array (which was measured to cost ~0.3 s per import in cache misses).
++struct persistent_range_snapshot {
++    static constexpr unsigned bucket_shift = 32;
++    std::vector<persistent_range> m_ranges;
++    std::vector<uint32_t> m_index;   // size = (max_end >> bucket_shift) + 2
++    uintptr_t m_index_base = 0;      // bucket of the first range start
++};
++std::mutex g_persistent_range_mutex;                         // writers and snapshot rebuilds
++std::map<uintptr_t, uintptr_t> g_persistent_range_map;       // start -> end, disjoint
++std::atomic<persistent_range_snapshot *> g_persistent_range_snapshot{nullptr};
++std::atomic<bool> g_persistent_range_dirty{false};           // snapshot stale
++std::atomic<uintptr_t> g_persistent_range_lo{UINTPTR_MAX};   // bounding box, only ever widens
++std::atomic<uintptr_t> g_persistent_range_hi{0};
++
++bool persistent_range_search(persistent_range_snapshot const & snap, uintptr_t p) {
++    std::vector<persistent_range> const & v = snap.m_ranges;
++    if (v.empty()) return false;
++    uintptr_t b = p >> persistent_range_snapshot::bucket_shift;
++    if (b < snap.m_index_base || b - snap.m_index_base + 1 >= snap.m_index.size()) return false;
++    // ranges starting in bucket b are v[idx[b] .. idx[b+1]); the last start <= p is among them or
++    // is the last range starting before bucket b (v[idx[b]-1]).
++    size_t i = snap.m_index[b - snap.m_index_base + 1];
++    while (i > 0 && v[i - 1].m_start > p) --i;
++    return i > 0 && p < v[i - 1].m_end;
++}
++
++// Called with the mutex held.
++persistent_range_snapshot * persistent_range_rebuild() {
++    persistent_range_snapshot * snap = new persistent_range_snapshot(); // retired snapshots are leaked, see above
++    snap->m_ranges.reserve(g_persistent_range_map.size());
++    for (auto const & kv : g_persistent_range_map)
++        snap->m_ranges.push_back(persistent_range{kv.first, kv.second});
++    if (!snap->m_ranges.empty()) {
++        unsigned const sh = persistent_range_snapshot::bucket_shift;
++        uintptr_t b0 = snap->m_ranges.front().m_start >> sh;
++        uintptr_t b1 = (snap->m_ranges.back().m_end - 1) >> sh;   // ranges are sorted by start and disjoint
++        for (auto const & r : snap->m_ranges) b1 = std::max<uintptr_t>(b1, (r.m_end - 1) >> sh);
++        snap->m_index_base = b0;
++        snap->m_index.assign(static_cast<size_t>(b1 - b0) + 2, 0);
++        // m_index[b - b0] = number of ranges with start < (b << sh)
++        size_t k = 0;
++        for (size_t b = b0; b <= b1 + 1; b++) {
++            while (k < snap->m_ranges.size() && (snap->m_ranges[k].m_start >> sh) < b) k++;
++            snap->m_index[b - b0] = static_cast<uint32_t>(k);
++        }
++    }
++    g_persistent_range_dirty.store(false, std::memory_order_relaxed);
++    g_persistent_range_snapshot.store(snap, std::memory_order_release);
++    return snap;
++}
++}
++
++extern "C" LEAN_EXPORT void lean_register_persistent_address_range(uintptr_t start, uintptr_t end) {
++    if (end <= start) return;
++    std::lock_guard<std::mutex> lock(g_persistent_range_mutex);
++    g_persistent_range_map[start] = end;
++    if (start < g_persistent_range_lo.load(std::memory_order_relaxed))
++        g_persistent_range_lo.store(start, std::memory_order_relaxed);
++    if (end > g_persistent_range_hi.load(std::memory_order_relaxed))
++        g_persistent_range_hi.store(end, std::memory_order_relaxed);
++    // release: a reader that sees `dirty` also sees the bounding box; readers that still use the
++    // old snapshot simply do not know the new range yet (always safe: they take the ordinary path)
++    g_persistent_range_dirty.store(true, std::memory_order_release);
++}
++
++extern "C" LEAN_EXPORT void lean_unregister_persistent_address_range(uintptr_t start, uintptr_t end) {
++    std::lock_guard<std::mutex> lock(g_persistent_range_mutex);
++    auto it = g_persistent_range_map.find(start);
++    if (it != g_persistent_range_map.end() && it->second == end) {
++        g_persistent_range_map.erase(it);
++        // Rebuild eagerly: after `munmap` the range may be reused by heap objects, and no reader
++        // may keep treating it as persistent.
++        persistent_range_rebuild();
++    }
++    // the bounding box is deliberately left as is: it is only a conservative pre-filter
++}
++
++extern "C" LEAN_EXPORT bool lean_is_in_persistent_address_range(void const * o) {
++    // `LEAN_NO_TOUCH=0` disables the no-touch paths without disabling the
++    // address-space reservation, to isolate the effect of the olean layout.
++    static bool const disabled = [] { char const * v = std::getenv("LEAN_NO_TOUCH"); return v && v[0] == '0'; }();
++    if (disabled) return false;
++    uintptr_t p = reinterpret_cast<uintptr_t>(o);
++    if (p < g_persistent_range_lo.load(std::memory_order_relaxed) ||
++        p >= g_persistent_range_hi.load(std::memory_order_relaxed)) return false;
++    persistent_range_snapshot * snap;
++    if (g_persistent_range_dirty.load(std::memory_order_acquire)) {
++        std::lock_guard<std::mutex> lock(g_persistent_range_mutex);
++        snap = g_persistent_range_dirty.load(std::memory_order_relaxed)
++            ? persistent_range_rebuild()
++            : g_persistent_range_snapshot.load(std::memory_order_acquire);
++    } else {
++        snap = g_persistent_range_snapshot.load(std::memory_order_acquire);
++    }
++    return snap != nullptr && persistent_range_search(*snap, p);
++}
++
++extern "C" LEAN_EXPORT lean_obj_res lean_array_fget_no_touch(b_lean_obj_arg a, b_lean_obj_arg i) {
++    lean_object * o = lean_array_get_core(a, lean_unbox(i));
++    if (!lean_is_scalar(o) && !lean_is_in_persistent_address_range(o)) lean_inc_ref(o);
++    return o;
++}
++
++// Tactic index: is this object a thunk?  `Lean.EnvExtension.getStateImpl` uses this to recognise a
++// *deferred* environment-extension state: the tactic index stores a `Thunk σ` in the extension's state slot
++// instead of the eagerly built `σ` and forces it on the first access.  A stock extension state is
++// never itself a thunk, so the tag test is an exact discriminator.
++extern "C" LEAN_EXPORT uint8_t lean_ext_state_is_thunk(b_lean_obj_arg o) {
++    return (!lean_is_scalar(o) && lean_ptr_tag(o) == LeanThunk) ? 1 : 0;
++}
++
+ static obj_res mark_persistent_fn(obj_arg o) {
+     lean_mark_persistent(o);
+     return lean_box(0);
+@@ -586,7 +719,9 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
+     while (!todo.empty()) {
+         object * o = todo.back();
+         todo.pop_back();
+-        if (!lean_is_scalar(o) && lean_has_rc(o)) {
++        // Objects inside a persistent address range are compacted-region objects with rc = 0:
++        // `lean_has_rc` would be false, so skip them without reading (faulting in) the header.
++        if (!lean_is_scalar(o) && !lean_is_in_persistent_address_range(o) && lean_has_rc(o)) {
+             lean_internal_set_rc(o, 0);
+ #if defined(__has_feature)
+ #if __has_feature(address_sanitizer)
+@@ -664,14 +799,18 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
+ #ifndef LEAN_MULTI_THREAD
+     return;
+ #endif
+-    if (lean_is_scalar(o) || !lean_is_st(o)) return;
++    if (lean_is_scalar(o) || lean_is_in_persistent_address_range(o) || !lean_is_st(o)) return;
+ 
+     buffer<object*> todo;
+     todo.push_back(o);
+     while (!todo.empty()) {
+         object * o = todo.back();
+         todo.pop_back();
+-        if (!lean_is_scalar(o) && lean_is_st(o)) {
++        // Lazy parts (same as `lean_mark_persistent`): objects inside a persistent address range are
++        // compacted-region objects with rc = 0, i.e. never single-threaded; skip them without
++        // reading (faulting in) the header. Storing a value that references ~1M such objects into
++        // a shared `IO.Ref` would otherwise touch every one of their pages.
++        if (!lean_is_scalar(o) && !lean_is_in_persistent_address_range(o) && lean_is_st(o)) {
+             lean_internal_set_rc(o, -lean_internal_get_rc(o));
+             uint8_t tag = lean_ptr_tag(o);
+             if (tag <= LeanMaxCtorTag) {
+diff --git a/src/runtime/process.cpp b/src/runtime/process.cpp
+index 2bf04e4..504bc2d 100644
+--- a/src/runtime/process.cpp
++++ b/src/runtime/process.cpp
+@@ -25,6 +25,10 @@ Author: Jared Roesch
+ #include <sys/wait.h>
+ #include <signal.h>
+ #include <limits.h> // NOLINT
++#ifdef __APPLE__
++#include <spawn.h>   // posix_spawn: avoids the vm_map_fork cost of the large PROT_NONE reservation
++#include <vector>
++#endif
+ #endif
+ 
+ #ifdef __linux
+@@ -435,6 +439,22 @@ static optional<pipe> setup_stdio(stdio cfg) {
+ extern "C" char **environ;
+ #endif
+ 
++#ifdef __APPLE__
++/* The `posix_spawn` path below exists because of the olean address reservation of
++   `library/module.cpp`: a `fork()` in a process holding that reservation costs ~0.4 s. It is
++   therefore part of the same change, and is turned off by the same switch, so that
++   `LEAN_MMAP_RESERVE=0` gives stock behaviour in both respects. */
++static bool posix_spawn_enabled() {
++    static bool enabled = [] {
++        if (char const * v = getenv("LEAN_MMAP_RESERVE")) {
++            if (v[0] == '0' && v[1] == '\0') return false;
++        }
++        return true;
++    }();
++    return enabled;
++}
++#endif
++
+ static obj_res spawn(string_ref const & proc_name, array_ref<string_ref> const & args, stdio stdin_mode, stdio stdout_mode,
+   stdio stderr_mode, option_ref<string_ref> const & cwd, array_ref<pair_ref<string_ref, option_ref<string_ref>>> const & env,
+   bool inherit_env, bool do_setsid) {
+@@ -450,6 +470,107 @@ static obj_res spawn(string_ref const & proc_name, array_ref<string_ref> const &
+         pargs.push_back(strdup(arg.data()));
+     pargs.push_back(NULL);
+ 
++#ifdef __APPLE__
++    if (posix_spawn_enabled()) {
++    // macOS: use `posix_spawn` instead of `fork`+`execvp`. A `fork()` in a process that holds the
++    // ~126 TB `PROT_NONE` olean reservation copies the parent's VM map (`vm_map_fork` walks the
++    // copy-inherited entries with pmap work proportional to their span, ~0.4 s per fork here); a
++    // clean `lake build` spawns >1,400 `lean`/`leanc` children and pays it on every one. `posix_spawn`
++    // is a kernel primitive that does not copy the parent map (measured ~0.036 s for 10 spawns at
++    // 64 TB, vs 2.4 s for `fork`). The file actions below reproduce exactly what the `fork` child
++    // did between `fork` and `execvp`: stdio redirection, closing the parent pipe ends, `chdir`, and
++    // (via a spawn attribute) `setsid`. Environment handling is done by building an explicit `envp`.
++    {
++        posix_spawn_file_actions_t actions;
++        posix_spawnattr_t attr;
++        posix_spawn_file_actions_init(&actions);
++        posix_spawnattr_init(&attr);
++
++        if (stdin_pipe) {
++            posix_spawn_file_actions_adddup2(&actions, stdin_pipe->m_read_fd, STDIN_FILENO);
++            posix_spawn_file_actions_addclose(&actions, stdin_pipe->m_write_fd);
++        } else if (stdin_mode == stdio::NUL) {
++            posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
++        }
++        if (stdout_pipe) {
++            posix_spawn_file_actions_adddup2(&actions, stdout_pipe->m_write_fd, STDOUT_FILENO);
++            posix_spawn_file_actions_addclose(&actions, stdout_pipe->m_read_fd);
++        } else if (stdout_mode == stdio::NUL) {
++            posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
++        }
++        if (stderr_pipe) {
++            posix_spawn_file_actions_adddup2(&actions, stderr_pipe->m_write_fd, STDERR_FILENO);
++            posix_spawn_file_actions_addclose(&actions, stderr_pipe->m_read_fd);
++        } else if (stderr_mode == stdio::NUL) {
++            posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
++        }
++        if (cwd) {
++            posix_spawn_file_actions_addchdir_np(&actions, cwd.get()->data());
++        }
++        if (do_setsid) {
++            posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
++        }
++
++        // Build the child environment. `inherit_env` starts from the parent's `environ`; the
++        // per-variable overrides then set or unset entries, exactly as the `fork` child's
++        // `setenv`/`unsetenv` loop did.
++        std::vector<std::string> envstrings;
++        auto setvar = [&](std::string const & key, std::string const & val) {
++            std::string prefix = key + "=";
++            for (auto & e : envstrings)
++                if (e.compare(0, prefix.size(), prefix) == 0) { e = key + "=" + val; return; }
++            envstrings.push_back(key + "=" + val);
++        };
++        auto unsetvar = [&](std::string const & key) {
++            std::string prefix = key + "=";
++            for (auto it = envstrings.begin(); it != envstrings.end(); )
++                if (it->compare(0, prefix.size(), prefix) == 0) it = envstrings.erase(it); else ++it;
++        };
++        if (inherit_env) {
++            for (char ** e = environ; *e; ++e) envstrings.push_back(*e);
++        }
++        for (auto & entry : env) {
++            if (entry.snd()) setvar(entry.fst().data(), entry.snd().get()->data());
++            else unsetvar(entry.fst().data());
++        }
++        std::vector<char *> envp;
++        envp.reserve(envstrings.size() + 1);
++        for (auto & e : envstrings) envp.push_back(const_cast<char *>(e.c_str()));
++        envp.push_back(NULL);
++
++        pid_t pid;
++        int rc = posix_spawnp(&pid, pargs[0], &actions, &attr, pargs.data(), envp.data());
++        posix_spawn_file_actions_destroy(&actions);
++        posix_spawnattr_destroy(&attr);
++        if (rc != 0) {
++            for (char * parg : pargs) if (parg != NULL) free(parg);
++            throw rc;
++        }
++        for (char * parg : pargs) if (parg != NULL) free(parg);
++
++        object * parent_stdin  = box(0);
++        object * parent_stdout = box(0);
++        object * parent_stderr = box(0);
++        if (stdin_pipe) {
++            close(stdin_pipe->m_read_fd);
++            parent_stdin = io_wrap_handle(fdopen(stdin_pipe->m_write_fd, "w"));
++        }
++        if (stdout_pipe) {
++            close(stdout_pipe->m_write_fd);
++            parent_stdout = io_wrap_handle(fdopen(stdout_pipe->m_read_fd, "r"));
++        }
++        if (stderr_pipe) {
++            close(stderr_pipe->m_write_fd);
++            parent_stderr = io_wrap_handle(fdopen(stderr_pipe->m_read_fd, "r"));
++        }
++        object_ref r = mk_cnstr(0, parent_stdin, parent_stdout, parent_stderr, sizeof(pid_t) + sizeof(uint8_t));
++        static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
++        cnstr_set_uint32(r.raw(), 3 * sizeof(object *), pid);
++        cnstr_set_uint8(r.raw(), 3 * sizeof(object *) + sizeof(pid_t), do_setsid);
++        return lean_io_result_mk_ok(r.steal());
++    }
++    }  // posix_spawn_enabled(); otherwise fall through to the `fork` path below
++#endif
+     int pid = fork();
+ 
+     if (pid == 0) {
+diff --git a/stage0/src/runtime/object.cpp b/stage0/src/runtime/object.cpp
+index 35707375eedf044ded32f3e1eae7cda33663c221..10e3cbf6accb13eab2b853a586728c73e7ed4525 100644
+GIT binary patch
+delta 471
+zcmYL`u};G<5QfFlft?ZQUl45tEnOIbs;W{tAhFRsags|gP3>Y|DiA}F`Urgjo&Yu;
+zgJ)r2MO@MrJXo@Q|M%bhUca<{)~)w2T=n}HUnT*x2j9tNlY2@TN=}uTjez)ul<7^(
+za`MPzytbxS5Z|(5x}Gn}7?r1;mMt8mwlLZg)S;le8Rg_0WnGY2YG=)y44=~;g_W;C
+zLEQs9TPG-mcv^eoa~(q)X@u}6IQ3E{3i#4;?VyckQW<Q%EmQ@$@(D?$OGaEHl*y1=
+zmkL@l>=u}7=Vi*2<l6UuaqXVY{*87v+SewAmgGe3sm%A$oWa}1l2rjFp-Fnm2ti4H
+znf9sEb8VCi)!RILpA2M%sOde@K5Ei!Cs8TkMv{4?Tmjp`^C4t8;>wxL*W?%rc9A%=
+e<!v}b{TEF*9gHwQfQ!v*aI~I=AJg#Q?dli6pr_XW
+
+delta 22
+dcmey@%+}n%w!y_^vPqCgbFka?U^m9q)&OSP2uT0{
+

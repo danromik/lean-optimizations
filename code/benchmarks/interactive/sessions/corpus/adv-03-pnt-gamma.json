@@ -1,0 +1,60 @@
+{
+  "name": "adv-03-pnt-gamma",
+  "tier": "advanced",
+  "project": "PrimeNumberTheoremAnd",
+  "initial_file": "PrimeNumberTheoremAnd/Mathlib/Analysis/SpecialFunctions/Gamma/CriticalLineDecay.lean",
+  "description": "Inside PrimeNumberTheoremAnd's `CriticalLineDecay.lean` (`Complex.Gamma` on the critical line: `simp`/`norm_num`/`nlinarith`/`positivity`/`calc`; PNT+ pins Lean v4.32.2, own toolchain). Models an expert who changes the statement of a private lemma used later (its dependent breaks: cascade), repairs the dependent, inserts a lemma mid-file with a missing explicit argument, runs `exact?`, and appends a `calc`-free corollary.",
+  "events": [
+    {"op": "wait", "ms": 8000, "note": "reads while the file elaborates"},
+    {"op": "goal", "after": "  rw [gamma_half_vertical_norm_sq]", "expect_goals": 1},
+    {"op": "wait", "ms": 4000},
+    {"op": "replace", "find": "private lemma exp_abs_div_two_le_cosh (x : ℝ) : Real.exp |x| / 2 ≤ Real.cosh x := by",
+     "text": "private lemma exp_abs_div_two_le_cosh (x : ℝ) : Real.exp |x| ≤ 2 * Real.cosh x := by",
+     "note": "statement change of a lemma used below"},
+    {"op": "expect_errors", "n": [1, 2]},
+    {"op": "goal", "end_of_line": "    simpa [hxabs] using exp_abs_div_two_le_cosh (Real.pi * τ)", "expect_goals": 1},
+    {"op": "wait", "ms": 4000, "note": "fixes the dependent"},
+    {"op": "replace", "find": "    simpa [hxabs] using exp_abs_div_two_le_cosh (Real.pi * τ)",
+     "text": "    have := exp_abs_div_two_le_cosh (Real.pi * τ)\n    rw [hxabs] at this\n    linarith"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "before": "Real.cosh_eq]"},
+    {"op": "wait", "ms": 4000},
+    {"op": "type", "before": "/-- Exact critical-line identity:", "pause_ms": 1200, "text": [
+      "private lemma cosh_pos' {x : ℝ} : 0 < Real.cosh x :=",
+      "  Real.cosh_pos",
+      "",
+      ""
+    ], "note": "missing explicit argument"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "  Real.cosh_pos\n", "text": "  Real.cosh_pos x\n"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end Complex", "pause_ms": 1200, "text": [
+      "example (x : ℝ) : 0 < Real.cosh x := by",
+      "  exact?",
+      "",
+      ""
+    ]},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  exact?", "text": "  exact Real.cosh_pos x"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "before": "end Complex", "pause_ms": 1500, "text": [
+      "theorem gamma_half_vertical_norm_le (τ : ℝ) :",
+      "    ‖Complex.Gamma (((1 / 2 : ℝ) : ℂ) + (τ : ℂ) * I)‖ ≤ Real.sqrt (2 * Real.pi) := by",
+      "  refine (gamma_half_vertical_norm_le_exp τ).trans ?_",
+      "  have h : Real.exp (-(Real.pi * |τ| / 2)) ≤ 1 := by",
+      "    rw [Real.exp_le_one_iff]",
+      "    have : 0 ≤ Real.pi * |τ| / 2 := by positivity",
+      "    linarith",
+      "  nlinarith [Real.sqrt_nonneg (2 * Real.pi), h]",
+      "",
+      ""
+    ]},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

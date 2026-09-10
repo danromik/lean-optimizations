@@ -1,0 +1,49 @@
+{
+  "name": "multi-00-single-control",
+  "kind": "multi",
+  "tier": "multi",
+  "project": "mathlib",
+  "description": "Control for the multi-file ladder: one file, `import Mathlib`, one worker. Same script as the primary document of multi-01/multi-02, so the 1-worker header, the setup/import split, the memory probes and the edit/goal/completion/`exact?` latencies are directly comparable with the 2- and 3-worker cases.",
+  "docs": [
+    {
+      "id": "A",
+      "file_name": "MultiA.lean",
+      "description": "the file the user is editing",
+      "initial_text": [
+        "import Mathlib",
+        "",
+        "-- the file the user is actually working in",
+        "theorem multiA_one (n : ℕ) : n + 0 = n := by",
+        "  simp",
+        "",
+        "theorem multiA_two (x y : ℝ) (h : x ≤ y) : x + 1 ≤ y + 1 := by",
+        "  linarith"
+      ]
+    }
+  ],
+  "events": [
+    {"op": "expect_no_errors"},
+    {"op": "mem", "label": "1-worker"},
+    {"op": "wait", "ms": 3000, "note": "reads the file"},
+    {"op": "wait", "ms": 3000, "note": "stands in for opening the second file"},
+    {"op": "mem", "label": "1-worker-b"},
+    {"op": "wait", "ms": 3000, "note": "stands in for opening the third file"},
+    {"op": "mem", "label": "1-worker-c"},
+    {"op": "goal", "after": "  linarith", "expect_goals": 0, "note": "goal request in worker 1"},
+    {"op": "type", "append": true, "pause_ms": 600, "text": ["", "theorem multiA_three (a b : ℝ) : a * b = b * a := by", "  ring"], "note": "edit in worker 1"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": ["", "example (n : ℕ) : n + 0 = n := Nat.add_z"]},
+    {"op": "completion", "after": "Nat.add_z", "expect_item": "Nat.add_zero", "note": "first completion in worker 1"},
+    {"op": "replace", "find": "Nat.add_z", "text": "Nat.add_zero n"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 800, "text": ["", "example (a b : ℕ) (h : a ≤ b) : a ≤ b + 1 := by", "  exact?"], "note": "library search in worker 1"},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "mem", "label": "after-exact"},
+    {"op": "replace", "find": "exact?", "text": "exact Nat.le_succ_of_le h"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "after": "Nat.le_succ_of_le", "expect_hover": true},
+    {"op": "expect_no_errors"}
+  ]
+}

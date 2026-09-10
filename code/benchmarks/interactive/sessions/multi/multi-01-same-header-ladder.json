@@ -1,0 +1,82 @@
+{
+  "name": "multi-01-same-header-ladder",
+  "kind": "multi",
+  "tier": "multi",
+  "project": "mathlib",
+  "description": "Three files with the *same* header (`import Mathlib`), opened one at a time and each allowed to settle before the next: the ladder that answers 'what does the 2nd and the 3rd simultaneously-open file cost?' with no contention confound. A memory probe after each step gives the incremental resident size and the incremental private footprint. The primary file's edits, completion and `exact?` then run with all three workers alive.",
+  "docs": [
+    {
+      "id": "A",
+      "file_name": "MultiA.lean",
+      "description": "the file the user is editing",
+      "initial_text": [
+        "import Mathlib",
+        "",
+        "-- the file the user is actually working in",
+        "theorem multiA_one (n : ℕ) : n + 0 = n := by",
+        "  simp",
+        "",
+        "theorem multiA_two (x y : ℝ) (h : x ≤ y) : x + 1 ≤ y + 1 := by",
+        "  linarith"
+      ]
+    },
+    {
+      "id": "B",
+      "file_name": "MultiB.lean",
+      "description": "second tab, same header, different body",
+      "initial_text": [
+        "import Mathlib",
+        "",
+        "theorem multiB_one (s t : Set ℕ) (x : ℕ) (h : x ∈ s) : x ∈ s ∪ t := by",
+        "  exact Set.mem_union_left t h",
+        "",
+        "theorem multiB_two (f : ℕ → ℕ) (hf : ∀ n, f n = n) : f 3 = 3 := by",
+        "  simp [hf]"
+      ],
+      "events": [{"op": "expect_no_errors"}]
+    },
+    {
+      "id": "C",
+      "file_name": "MultiC.lean",
+      "description": "third tab, same header, different body",
+      "initial_text": [
+        "import Mathlib",
+        "",
+        "theorem multiC_one (a b : ℤ) (h : a ∣ b) (c : ℤ) : a ∣ b * c := by",
+        "  exact Dvd.dvd.mul_right h c",
+        "",
+        "theorem multiC_two (l : List ℕ) : l.reverse.length = l.length := by",
+        "  simp"
+      ],
+      "events": [{"op": "expect_no_errors"}]
+    }
+  ],
+  "events": [
+    {"op": "expect_no_errors"},
+    {"op": "mem", "label": "1-worker"},
+    {"op": "wait", "ms": 3000, "note": "reads the file"},
+    {"op": "open_doc", "doc": "B", "note": "opens a second file with the same header"},
+    {"op": "await_doc", "doc": "B"},
+    {"op": "mem", "label": "2-workers"},
+    {"op": "wait", "ms": 3000},
+    {"op": "open_doc", "doc": "C", "note": "opens a third file with the same header"},
+    {"op": "await_doc", "doc": "C"},
+    {"op": "mem", "label": "3-workers"},
+    {"op": "goal", "after": "  linarith", "expect_goals": 0, "note": "goal request in worker 1 with 3 workers alive"},
+    {"op": "type", "append": true, "pause_ms": 600, "text": ["", "theorem multiA_three (a b : ℝ) : a * b = b * a := by", "  ring"], "note": "edit in worker 1 with 3 workers alive"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": ["", "example (n : ℕ) : n + 0 = n := Nat.add_z"]},
+    {"op": "completion", "after": "Nat.add_z", "expect_item": "Nat.add_zero", "note": "first completion in worker 1"},
+    {"op": "replace", "find": "Nat.add_z", "text": "Nat.add_zero n"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 800, "text": ["", "example (a b : ℕ) (h : a ≤ b) : a ≤ b + 1 := by", "  exact?"], "note": "library search in worker 1 with 3 workers alive"},
+    {"op": "expect_message", "contains": "Try this"},
+    {"op": "mem", "label": "after-exact"},
+    {"op": "replace", "find": "exact?", "text": "exact Nat.le_succ_of_le h"},
+    {"op": "expect_no_errors"},
+    {"op": "hover", "after": "Nat.le_succ_of_le", "expect_hover": true},
+    {"op": "expect_no_errors"}
+  ]
+}

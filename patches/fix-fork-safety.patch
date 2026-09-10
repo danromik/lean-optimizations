@@ -1,0 +1,86 @@
+diff --git a/src/runtime/object.cpp b/src/runtime/object.cpp
+--- a/src/runtime/object.cpp
++++ b/src/runtime/object.cpp
+@@ -4,6 +4,7 @@
+ 
+ Author: Leonardo de Moura
+ */
++#include <new>
+ #include <atomic>
+ #include <string>
+ #include <algorithm>
+@@ -1081,7 +1082,59 @@
+     bool shutting_down() const {
+         return m_shutting_down;
+     }
++
++    /* Repair this manager inside a child created by `fork()`.
++
++       After `fork()` only the forking thread exists.  Every `pthread_t` in
++       `m_std_workers`, and every dedicated worker counted by
++       `m_num_dedicated_workers`, names a thread that is not present in the
++       child, while `m_idle_std_workers` still counts them as parked and idle.
++       `enqueue_core` therefore takes its `m_queue_cv.notify_one()` branch
++       instead of `spawn_worker()`, and every standard-priority task is enqueued
++       and never run: the first `lean_task_get` blocks forever.  Destroying the
++       manager is not an option either -- `~task_manager` joins `m_std_workers`
++       and `lthread::join` throws "failed to join thread" in the child.
++
++       This resets exactly the state that describes threads, and deliberately
++       *preserves* `m_queues`, `m_queues_size`, `m_max_prio` and
++       `m_max_std_workers`, so work the parent had already enqueued but not yet
++       started is still runnable in the child.
+ 
++       The child must call this before running any Lean code, from the thread
++       that called `fork()`, and (as POSIX requires of everything else here) the
++       parent should be quiesced at the fork instant. */
++    void reinit_after_fork() {
++        // 1. Abandon the inherited worker handles *without* joining them.  The
++        //    `lthread::imp` control blocks are leaked (a few hundred bytes);
++        //    running their destructors would touch dead pthreads.
++        for (auto & t : m_std_workers)
++            (void)t.release();
++        m_std_workers.clear();
++        m_idle_std_workers      = 0;
++        m_num_dedicated_workers = 0;
++        m_shutting_down         = false;
++
++        // 2. Re-create the synchronisation objects in place.  A parked worker
++        //    holds none of them, but a fork that lands while some other thread
++        //    is inside `enqueue`/`resolve`/`task_get` would inherit a locked
++        //    mutex or a condition variable with a dead waiter, and there is no
++        //    portable way to inspect either.  Re-initialising is safe here
++        //    precisely because no other thread exists to be holding them.
++        new (&m_mutex) mutex();
++        new (&m_queue_cv) condition_variable();
++        new (&m_task_finished_cv) condition_variable();
++        new (&m_dedicated_finished_cv) condition_variable();
++
++        // 3. Hand any inherited queue to a fresh worker.  Without this the
++        //    queued tasks would sit there until the child happens to enqueue
++        //    something else.
++        if (m_queues_size > 0) {
++            unique_lock<mutex> lock(m_mutex);
++            if (m_std_workers.size() < m_max_std_workers)
++                spawn_worker();
++        }
++    }
++
+     uint8_t get_task_state(lean_task_object * t) {
+         unique_lock<mutex> lock(m_mutex);
+         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
+@@ -1124,6 +1177,14 @@
+ 
+ extern "C" LEAN_EXPORT void lean_init_task_manager() {
+     lean_init_task_manager_using(get_lean_num_threads());
++}
++
++/* Make the inherited task manager usable again in a child created by `fork()`.
++   Must be called by the child, from the thread that called `fork()`, before any
++   Lean code runs.  See `task_manager::reinit_after_fork`. */
++extern "C" LEAN_EXPORT void lean_reinit_task_manager_after_fork() {
++    if (g_task_manager)
++        g_task_manager->reinit_after_fork();
+ }
+ 
+ extern "C" LEAN_EXPORT void lean_finalize_task_manager() {

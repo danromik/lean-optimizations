@@ -1,0 +1,48 @@
+{
+  "name": "inter-03-mathlib-topology",
+  "tier": "intermediate",
+  "project": "mathlib",
+  "initial_file": "Mathlib/Topology/Basic.lean",
+  "description": "Contributor session inside Mathlib's own `Mathlib/Topology/Basic.lean` (244 lines, `module` header, precise imports; edited as a scratch copy). Models someone who opens the file, reads for a while, appends a lemma at the end (with an argument-count mistake), inserts a lemma near the top so the rest of the file re-elaborates, breaks and repairs a mid-file proof (two more cascades), and uses goal/hover/completion.",
+  "events": [
+    {"op": "wait", "ms": 5000, "note": "reads the file"},
+    {"op": "goal", "after": "isOpen_inter s t hs ht := by", "expect_goals": 1},
+    {"op": "hover", "before": "isOpen_compl_iff.mpr"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem isOpen_inter_three {X : Type*} [TopologicalSpace X] {s t u : Set X}",
+      "    (hs : IsOpen s) (ht : IsOpen t) (hu : IsOpen u) : IsOpen (s ∩ t ∩ u) := by",
+      "  exact hs.inter ht hu"
+    ], "note": "one argument too many"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "exact hs.inter ht hu", "text": "exact (hs.inter ht).inter hu"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 4000, "note": "decides the lemma belongs near the top"},
+    {"op": "insert", "after_line": "variable [TopologicalSpace X]", "text": [
+      "",
+      "theorem IsOpen.inter3 (h₁ : IsOpen s₁) (h₂ : IsOpen s₂) (h₃ : IsOpen t) : IsOpen (s₁ ∩ s₂ ∩ t) :=",
+      "  (h₁.inter h₂).inter h₃",
+      ""
+    ], "note": "insert near the top: ~170 lines below re-elaborate"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "theorem isClosed_univ : IsClosed (univ : Set X) := isClosed_const", "text": "theorem isClosed_univ : IsClosed (univ : Set X) := isOpen_const", "note": "mid-file mistake (cascade)"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "theorem isClosed_univ : IsClosed (univ : Set X) := isOpen_const", "text": "theorem isClosed_univ : IsClosed (univ : Set X) := isClosed_const"},
+    {"op": "expect_no_errors"},
+    {"op": "goal", "after": "IsClosed (s₁ ∩ s₂) := by", "expect_goals": 1},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example {X : Type*} [TopologicalSpace X] {ι : Sort*} {f : ι → Set X} (h : ∀ i, IsOpen (f i)) : IsOpen (⋃ i, f i) := isOpen_iU"
+    ]},
+    {"op": "completion", "after": ":= isOpen_iU", "expect_item": "isOpen_iUnion"},
+    {"op": "replace", "find": ":= isOpen_iU", "text": ":= isOpen_iUnion h"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

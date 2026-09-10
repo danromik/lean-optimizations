@@ -1,0 +1,84 @@
+{
+ "name": "multi-04-corpus-same-header-ladder",
+ "kind": "multi",
+ "tier": "multi",
+ "project": "formal-conjectures",
+ "description": "Three real files from a real corpus project (formal-conjectures, pinned to v4.33.1 so the fork can serve it), opened one at a time. All three carry the identical header `import FormalConjecturesUtil` - which is what almost every file in that repository imports - so this is the same-header case in a real project rather than in scratch files.",
+ "docs": [
+  {
+   "id": "A",
+   "file_name": "Fc64313.lean",
+   "initial_file": "FormalConjectures/OEIS/64313.lean",
+   "description": "worker 1",
+   "events": []
+  },
+  {
+   "id": "B",
+   "file_name": "Fc102847.lean",
+   "initial_file": "FormalConjectures/OEIS/102847.lean",
+   "description": "worker 2",
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ]
+  },
+  {
+   "id": "C",
+   "file_name": "Fc1157.lean",
+   "initial_file": "FormalConjectures/OEIS/1157.lean",
+   "description": "worker 3",
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "op": "expect_no_errors"
+  },
+  {
+   "op": "mem",
+   "label": "1-worker"
+  },
+  {
+   "op": "wait",
+   "ms": 3000
+  },
+  {
+   "op": "open_doc",
+   "doc": "B",
+   "note": "second file, identical header"
+  },
+  {
+   "op": "await_doc",
+   "doc": "B"
+  },
+  {
+   "op": "mem",
+   "label": "2-workers"
+  },
+  {
+   "op": "wait",
+   "ms": 3000
+  },
+  {
+   "op": "open_doc",
+   "doc": "C",
+   "note": "third file, identical header"
+  },
+  {
+   "op": "await_doc",
+   "doc": "C"
+  },
+  {
+   "op": "mem",
+   "label": "3-workers"
+  },
+  {
+   "op": "expect_no_errors"
+  }
+ ]
+}

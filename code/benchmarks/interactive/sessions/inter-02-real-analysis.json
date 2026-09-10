@@ -1,0 +1,88 @@
+{
+  "name": "inter-02-real-analysis",
+  "tier": "intermediate",
+  "project": "mathlib",
+  "description": "Warm-up inequalities for a real-analysis development with precise imports. Models an intermediate user who tries `linarith` on a nonlinear goal, adds a `have` that is still nonlinear, then uses `nlinarith`; runs `ring` where `field_simp` is needed first; confuses `Real.sqrt_sq` with `Real.sq_sqrt`; refactors a fact into a helper lemma above (cascade re-elaboration); and replaces an unhelpful `simp only` by the right lemma.",
+  "initial_text": [
+    "import Mathlib.Data.Real.Sqrt",
+    "import Mathlib.Tactic.Linarith",
+    "import Mathlib.Tactic.FieldSimp",
+    "import Mathlib.Tactic.Ring",
+    "import Mathlib.Tactic.Positivity",
+    "",
+    "/-! Warm-up inequalities. -/",
+    ""
+  ],
+  "events": [
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1500, "text": [
+      "",
+      "theorem two_mul_le_sq_add_sq (x y : ℝ) : 2 * x * y ≤ x ^ 2 + y ^ 2 := by",
+      "  linarith"
+    ]},
+    {"op": "expect_message", "contains": "linarith failed"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "  linarith", "text": ["  have h := sq_nonneg x", "  linarith"], "note": "wrong square as the hint"},
+    {"op": "expect_message", "contains": "linarith failed"},
+    {"op": "goal", "end_of_line": "have h := sq_nonneg x", "expect_goals": 1},
+    {"op": "wait", "ms": 4000},
+    {"op": "replace", "find": "  have h := sq_nonneg x\n  linarith", "text": "  nlinarith [sq_nonneg (x - y)]"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1200, "text": [
+      "",
+      "theorem sq_add_self_div (x : ℝ) (hx : x ≠ 0) : (x ^ 2 + x) / x = x + 1 := by",
+      "  ring"
+    ], "note": "ring cannot use hx"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "x + 1 := by\n  ring", "text": "x + 1 := by\n  field_simp\n  ring", "note": "field_simp already closes the goal"},
+    {"op": "expect_message", "contains": "no goals"},
+    {"op": "wait", "ms": 2000},
+    {"op": "delete", "text": "\n  ring"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1500, "text": [
+      "",
+      "theorem sqrt_le_half_add (x : ℝ) (hx : 0 ≤ x) : Real.sqrt x ≤ (x + 1) / 2 := by",
+      "  have h := sq_nonneg (Real.sqrt x - 1)",
+      "  have hs : Real.sqrt x ^ 2 = x := Real.sqrt_sq hx",
+      "  nlinarith [h, hs]"
+    ], "note": "sqrt_sq vs sq_sqrt"},
+    {"op": "expect_errors", "n": 1},
+    {"op": "hover", "before": "Real.sqrt_sq hx"},
+    {"op": "wait", "ms": 3000},
+    {"op": "replace", "find": "Real.sqrt_sq hx", "text": "Real.sq_sqrt hx"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 4000, "note": "refactor: name the AM-GM fact"},
+    {"op": "insert", "before": "theorem two_mul_le_sq_add_sq", "text": [
+      "lemma sq_sub_expand_nonneg (x y : ℝ) : 0 ≤ x ^ 2 - 2 * x * y + y ^ 2 := by",
+      "  nlinarith [sq_nonneg (x - y)]",
+      "",
+      ""
+    ], "note": "helper lemma above: cascade"},
+    {"op": "expect_no_errors"},
+    {"op": "replace", "find": "  nlinarith [sq_nonneg (x - y)]\ntheorem sq_add_self_div", "text": "  linarith [sq_sub_expand_nonneg x y]\ntheorem sq_add_self_div"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 3000},
+    {"op": "type", "append": true, "pause_ms": 1000, "text": [
+      "",
+      "theorem abs_sub_comm' (a b : ℝ) : |a - b| = |b - a| := by",
+      "  simp only [sub_eq_add_neg]"
+    ]},
+    {"op": "expect_errors", "n": 1},
+    {"op": "wait", "ms": 2500},
+    {"op": "replace", "find": "  simp only [sub_eq_add_neg]", "text": "  exact abs_sub_comm a b"},
+    {"op": "expect_no_errors"},
+    {"op": "wait", "ms": 2000},
+    {"op": "type", "append": true, "pause_ms": 500, "text": [
+      "",
+      "example (x : ℝ) (hx : 0 ≤ x) : Real.sqrt (x ^ 2) = x := Real.sqrt_s"
+    ]},
+    {"op": "completion", "after": ":= Real.sqrt_s", "expect_item": "Real.sqrt_sq"},
+    {"op": "replace", "find": ":= Real.sqrt_s", "text": ":= Real.sqrt_sq hx"},
+    {"op": "expect_no_errors"},
+    {"op": "save"},
+    {"op": "expect_no_errors"}
+  ]
+}

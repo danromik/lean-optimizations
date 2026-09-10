@@ -1,0 +1,160 @@
+{
+ "name": "multi-02-same-header-overlap",
+ "kind": "multi",
+ "tier": "multi",
+ "project": "mathlib",
+ "description": "Three files with the same header (`import Mathlib`) opened 4 s and 8 s after the first, i.e. all three workers import *simultaneously* — the contention case. The primary file's edits, completion and `exact?` then run while the other two workers are still importing. Compare its headers with multi-01's ladder to separate 'a second worker costs a full import' from 'a second worker slows the first one down'.",
+ "docs": [
+  {
+   "id": "A",
+   "file_name": "MultiA.lean",
+   "description": "the file the user is editing",
+   "initial_text": [
+    "import Mathlib",
+    "",
+    "-- the file the user is actually working in",
+    "theorem multiA_one (n : ℕ) : n + 0 = n := by",
+    "  simp",
+    "",
+    "theorem multiA_two (x y : ℝ) (h : x ≤ y) : x + 1 ≤ y + 1 := by",
+    "  linarith"
+   ]
+  },
+  {
+   "id": "B",
+   "file_name": "MultiB.lean",
+   "description": "second tab, same header, different body",
+   "initial_text": [
+    "import Mathlib",
+    "",
+    "theorem multiB_one (s t : Set ℕ) (x : ℕ) (h : x ∈ s) : x ∈ s ∪ t := by",
+    "  exact Set.mem_union_left t h",
+    "",
+    "theorem multiB_two (f : ℕ → ℕ) (hf : ∀ n, f n = n) : f 3 = 3 := by",
+    "  simp [hf]"
+   ],
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ],
+   "open_at_ms": 4000
+  },
+  {
+   "id": "C",
+   "file_name": "MultiC.lean",
+   "description": "third tab, same header, different body",
+   "initial_text": [
+    "import Mathlib",
+    "",
+    "theorem multiC_one (a b : ℤ) (h : a ∣ b) (c : ℤ) : a ∣ b * c := by",
+    "  exact Dvd.dvd.mul_right h c",
+    "",
+    "theorem multiC_two (l : List ℕ) : l.reverse.length = l.length := by",
+    "  simp"
+   ],
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ],
+   "open_at_ms": 8000
+  }
+ ],
+ "events": [
+  {
+   "op": "expect_no_errors",
+   "note": "worker 1 done; workers 2 and 3 are still importing"
+  },
+  {
+   "op": "mem",
+   "label": "opening"
+  },
+  {
+   "op": "goal",
+   "after": "  linarith",
+   "expect_goals": 0,
+   "note": "goal request while 2 and 3 import"
+  },
+  {
+   "op": "type",
+   "append": true,
+   "pause_ms": 600,
+   "text": [
+    "",
+    "theorem multiA_three (a b : ℝ) : a * b = b * a := by",
+    "  ring"
+   ],
+   "note": "edit while workers 2 and 3 import"
+  },
+  {
+   "op": "expect_no_errors"
+  },
+  {
+   "op": "type",
+   "append": true,
+   "pause_ms": 500,
+   "text": [
+    "",
+    "example (n : ℕ) : n + 0 = n := Nat.add_z"
+   ]
+  },
+  {
+   "op": "completion",
+   "after": "Nat.add_z",
+   "expect_item": "Nat.add_zero",
+   "note": "first completion while workers 2 and 3 import"
+  },
+  {
+   "op": "replace",
+   "find": "Nat.add_z",
+   "text": "Nat.add_zero n"
+  },
+  {
+   "op": "expect_no_errors"
+  },
+  {
+   "op": "type",
+   "append": true,
+   "pause_ms": 800,
+   "text": [
+    "",
+    "example (a b : ℕ) (h : a ≤ b) : a ≤ b + 1 := by",
+    "  exact?"
+   ],
+   "note": "library search while workers 2 and 3 import"
+  },
+  {
+   "op": "expect_message",
+   "contains": "Try this"
+  },
+  {
+   "op": "replace",
+   "find": "exact?",
+   "text": "exact Nat.le_succ_of_le h"
+  },
+  {
+   "op": "expect_no_errors"
+  },
+  {
+   "op": "await_doc",
+   "doc": "B"
+  },
+  {
+   "op": "await_doc",
+   "doc": "C"
+  },
+  {
+   "op": "mem",
+   "label": "3-workers"
+  },
+  {
+   "op": "hover",
+   "after": "Nat.le_succ_of_le",
+   "expect_hover": true
+  },
+  {
+   "op": "expect_no_errors"
+  }
+ ]
+}

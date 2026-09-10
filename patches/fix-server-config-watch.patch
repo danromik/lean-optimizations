@@ -1,0 +1,128 @@
+diff --git a/src/Lean/Data/Lsp/Internal.lean b/src/Lean/Data/Lsp/Internal.lean
+index bd64732..b2e82e4 100644
+--- a/src/Lean/Data/Lsp/Internal.lean
++++ b/src/Lean/Data/Lsp/Internal.lean
+@@ -337,6 +337,13 @@ Informs the worker that one of its dependencies has gone stale and likely needs
+ structure LeanStaleDependencyParams where
+   /-- The dependency that is stale. -/
+   staleDependency : DocumentUri
++  /--
++  Whether `staleDependency` is a build configuration file (a lakefile or the Lake manifest) instead
++  of an imported module. A build configuration change affects how the file is *elaborated* — the
++  options, the package, the dynlibs that `lake setup-file` reports — and not just whether its
++  imports are up to date, so the worker phrases its diagnostic differently.
++  -/
++  isBuildConfig : Bool := false
+   deriving FromJson, ToJson
+ 
+ /-- LSP type for `Lean.OpenDecl`. -/
+diff --git a/src/Lean/Server/FileWorker.lean b/src/Lean/Server/FileWorker.lean
+index cf8058a..6d33ecd 100644
+--- a/src/Lean/Server/FileWorker.lean
++++ b/src/Lean/Server/FileWorker.lean
+@@ -614,16 +614,21 @@ section NotificationHandling
+     set <| { st with pendingRequests := st.pendingRequests.erase p.id }
+ 
+   /--
+-  Received from the watchdog when a dependency of this file is detected as being stale.
++  Received from the watchdog when a dependency of this file is detected as being stale, or when the
++  build configuration that this file was set up with has changed.
+   Issues a sticky diagnostic to the client that it should run "Restart File".
+   -/
+-  def handleStaleDependency (_ : LeanStaleDependencyParams) : WorkerM Unit := do
++  def handleStaleDependency (p : LeanStaleDependencyParams) : WorkerM Unit := do
+     let ctx ← read
+     let s ← get
+     let text := s.doc.meta.text
+     let importOutOfDateMessage :=
+-      .text s!"Imports are out of date and should be rebuilt; \
+-        use the \"Restart File\" command in your editor."
++      if p.isBuildConfig then
++        .text s!"The build configuration of this project has changed; this file is still using \
++          the configuration it was opened with. Use the \"Restart File\" command in your editor."
++      else
++        .text s!"Imports are out of date and should be rebuilt; \
++          use the \"Restart File\" command in your editor."
+     let diagnostic := {
+       range      := ⟨⟨0, 0⟩, ⟨1, 0⟩⟩
+       fullRange? := some ⟨⟨0, 0⟩, text.utf8PosToLspPos text.source.rawEndPos⟩
+diff --git a/src/Lean/Server/Watchdog.lean b/src/Lean/Server/Watchdog.lean
+index dedb281..5c0c86e 100644
+--- a/src/Lean/Server/Watchdog.lean
++++ b/src/Lean/Server/Watchdog.lean
+@@ -940,12 +940,14 @@ section ServerM
+ 
+   /--
+   Sends a notification to the file worker identified by `uri` that its dependency `staleDependency`
+-  is out-of-date.
++  is out-of-date. `isBuildConfig` marks `staleDependency` as a build configuration file (a lakefile
++  or the Lake manifest) rather than an imported module.
+   -/
+   def notifyAboutStaleDependency (uri : DocumentUri) (staleDependency : DocumentUri)
+-      : ServerM Unit :=
++      (isBuildConfig : Bool := false) : ServerM Unit :=
+     let notification := Notification.mk "$/lean/staleDependency" {
+       staleDependency := staleDependency
++      isBuildConfig := isBuildConfig
+       : LeanStaleDependencyParams
+     }
+     tryWriteMessage uri notification
+@@ -1277,9 +1279,24 @@ section NotificationHandling
+   def handleDidClose (p : DidCloseTextDocumentParams) : ServerM Unit :=
+     terminateFileWorker p.textDocument.uri
+ 
++  /--
++  Whether `path` is a file that determines *how* the workspace is built rather than what it
++  contains: a Lake package configuration or the manifest of resolved dependencies. Changing one of
++  these can change the `leanOptions`, the package and the dynlibs that `lake setup-file` reports for
++  any file of the workspace, so it is not a dependency of some particular file in the way that an
++  imported module is.
++  Note that `lakefile.lean` also has the `lean` extension, but is never part of an import closure.
++  -/
++  def isBuildConfigFile (path : System.FilePath) : Bool :=
++    match path.fileName with
++    | some "lakefile.toml" | some "lakefile.lean" | some "lake-manifest.json" => true
++    | _ => false
++
+   def handleDidChangeWatchedFiles (p : DidChangeWatchedFilesParams) : ServerM Unit := do
+     let changes := p.changes.filterMap fun c => do return (c, ← fileUriToPath? c.uri)
+-    let leanChanges := changes.filter fun (_, path) => path.extension == "lean"
++    let configChanges := changes.filter fun (_, path) => isBuildConfigFile path
++    let leanChanges := changes.filter fun (_, path) =>
++      path.extension == "lean" && ! isBuildConfigFile path
+     let ileanChanges := changes.filter fun (_, path) => path.extension == "ilean"
+     if ! leanChanges.isEmpty then
+       let importData ← (← read).importData.get
+@@ -1287,6 +1304,15 @@ section NotificationHandling
+         let dependents := importData.importedBy.getD c.uri ∅
+         for dependent in dependents do
+           notifyAboutStaleDependency dependent c.uri
++    if let some (c, _) := configChanges[0]? then
++      -- The build configuration is not part of any import closure: it reaches a file worker only
++      -- through the `lake setup-file` call that the worker makes when it processes its header, so
++      -- every open file may now be elaborating with a configuration that no longer holds. Notify
++      -- all of them, and only once per batch, since `lake update` rewrites several of these files
++      -- at a time.
++      let fws ← (← read).fileWorkersRef.get
++      for ⟨uri, _⟩ in fws do
++        notifyAboutStaleDependency uri c.uri (isBuildConfig := true)
+     if ! ileanChanges.isEmpty then
+       let oleanSearchPath ← Lean.searchPathRef.get
+       for (c, path) in ileanChanges do
+@@ -1621,7 +1647,15 @@ def initAndRunWatchdogAux : ServerM Unit := do
+           id := "lean_watcher"
+           method := "workspace/didChangeWatchedFiles"
+           registerOptions := some <| toJson {
+-            watchers := #[ { globPattern := "**/*.lean" }, { globPattern := "**/*.ilean" } ]
++            watchers := #[
++              { globPattern := "**/*.lean" },
++              { globPattern := "**/*.ilean" },
++              -- Build configuration: see `isBuildConfigFile`. `lakefile.lean` is already covered by
++              -- `**/*.lean`, but is listed for the benefit of clients that watch by file name.
++              { globPattern := "**/lakefile.toml" },
++              { globPattern := "**/lakefile.lean" },
++              { globPattern := "**/lake-manifest.json" }
++            ]
+             : DidChangeWatchedFilesRegistrationOptions
+             }
+         }]

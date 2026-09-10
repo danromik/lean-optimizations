@@ -1,0 +1,90 @@
+{
+ "name": "multi-03-distinct-headers-ladder",
+ "kind": "multi",
+ "tier": "multi",
+ "project": "mathlib",
+ "description": "Three real Mathlib files with three *different* headers (number theory, analysis, probability), opened one at a time and each allowed to settle. This is the case a snapshot-per-header cache does NOT help: every worker's import closure differs, so nothing can be reused between them. The comparison with multi-01 is the point.",
+ "docs": [
+  {
+   "id": "A",
+   "file_name": "Bertrand.lean",
+   "initial_file": "Mathlib/NumberTheory/Bertrand.lean",
+   "description": "worker 1 - number theory closure",
+   "events": []
+  },
+  {
+   "id": "B",
+   "file_name": "LogDeriv.lean",
+   "initial_file": "Mathlib/Analysis/SpecialFunctions/Log/Deriv.lean",
+   "description": "worker 2 - analysis closure",
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ]
+  },
+  {
+   "id": "C",
+   "file_name": "CentralLimitTheorem.lean",
+   "initial_file": "Mathlib/Probability/CentralLimitTheorem.lean",
+   "description": "worker 3 - probability closure",
+   "events": [
+    {
+     "op": "expect_no_errors"
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "op": "expect_no_errors"
+  },
+  {
+   "op": "mem",
+   "label": "1-worker"
+  },
+  {
+   "op": "wait",
+   "ms": 3000
+  },
+  {
+   "op": "open_doc",
+   "doc": "B",
+   "note": "second file, different header"
+  },
+  {
+   "op": "await_doc",
+   "doc": "B"
+  },
+  {
+   "op": "mem",
+   "label": "2-workers"
+  },
+  {
+   "op": "wait",
+   "ms": 3000
+  },
+  {
+   "op": "open_doc",
+   "doc": "C",
+   "note": "third file, different header"
+  },
+  {
+   "op": "await_doc",
+   "doc": "C"
+  },
+  {
+   "op": "mem",
+   "label": "3-workers"
+  },
+  {
+   "op": "goal",
+   "line": 0,
+   "col": 0,
+   "note": "cheap round-trip with 3 workers alive"
+  },
+  {
+   "op": "expect_no_errors"
+  }
+ ]
+}
