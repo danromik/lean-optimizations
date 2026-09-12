@@ -1,7 +1,16 @@
 # Optimizing the Lean and Mathlib toolchain — the release package
 
 This package accompanies the paper *Optimizing the Lean and Mathlib toolchain*, which is included
-here in [`paper/`](paper/). What follows is the code and the evidence behind it: eleven
+here in [`paper/`](paper/). 
+
+*Note on AI usage by the project author (Dan Romik): the paper is written by me and is the careful writeup 
+of the project meant for human readers. This README and the other technical documentss in the package are 
+written by AI and either left untouched by me or only lightly edited. For more details on my AI usage, see 
+the AI usage acknowledgement section of the paper (section 1.8).*
+
+------
+
+What follows is the code and the evidence behind it: eleven
 improvements, of three kinds.
 
 **Loading the library faster.** Six changes to how Lean maps and reads Mathlib, shipped as one
